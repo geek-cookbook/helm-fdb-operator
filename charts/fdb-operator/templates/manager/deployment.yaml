@@ -20,6 +20,7 @@ spec:
       labels:
         {{- include "chart.labels" . | nindent 8 }}
     spec:
+      replicas: {{ .Values.operator.replicas }}
       securityContext:
         runAsUser: 40590
         runAsGroup: 40590
@@ -32,11 +33,13 @@ spec:
         - --enable-leader-election
         command:
         - /manager
+        {{- if not .Values.operator.globalMode.enabled }}
         env:
         - name: WATCH_NAMESPACE
           valueFrom:
             fieldRef:
               fieldPath: metadata.namespace
+        {{ end -}}
         image: {{ .Values.operator.image }}:{{ .Values.operator.tag }}
         imagePullPolicy: {{ .Values.operator.imagePullPolicy }}
         name: manager
