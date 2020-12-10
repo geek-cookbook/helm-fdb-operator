@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - master
+      - main # assume that the branch name may change in future
     paths:
       - 'charts/**' 
       - '.github/**'     
