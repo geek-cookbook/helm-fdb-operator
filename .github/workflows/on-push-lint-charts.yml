@@ -28,9 +28,9 @@ jobs:
         run: |
           wget https://github.com/zegl/kube-score/releases/download/v1.10.0/kube-score_1.10.0_linux_amd64 -O- > kube-score
           chmod 755 kube-score
-          
+
       - name: Kube-score generated manifests
-        run: helm template helm/fdb-operator | ./kube-score score -
+        run: helm template charts/* | ./kube-score score -
 
       - name: Set up chart-testing
         uses: helm/chart-testing-action@v2.0.1
