@@ -30,9 +30,9 @@ jobs:
           chmod 755 kube-score
 
       - name: Kube-score generated manifests
-        run: helm template charts/* | ./kube-score score - \
-              --ignore-test pod-networkpolicy \
-              --ignore-test deployment-has-poddisruptionbudget \
+        run: helm template charts/* | ./kube-score score -
+              --ignore-test pod-networkpolicy
+              --ignore-test deployment-has-poddisruptionbudget
               --ignore-test deployment-has-host-podantiaffinity
 
       - name: Set up chart-testing
