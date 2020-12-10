@@ -39,7 +39,7 @@ spec:
           valueFrom:
             fieldRef:
               fieldPath: metadata.namespace
-        {{ end -}}
+        {{- end }}
         image: {{ .Values.operator.image }}:{{ .Values.operator.tag }}
         imagePullPolicy: {{ .Values.operator.imagePullPolicy }}
         name: manager
