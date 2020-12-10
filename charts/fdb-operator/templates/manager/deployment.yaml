@@ -21,6 +21,7 @@ spec:
       labels:
         {{- include "chart.labels" . | nindent 8 }}
     spec:
+      replicas: {{ .Values.operator.replicas }}
       securityContext:
         runAsUser: 40590
         runAsGroup: 40590
@@ -39,7 +40,7 @@ spec:
           valueFrom:
             fieldRef:
               fieldPath: metadata.namespace
-        {{- end }}
+        {{ end -}}
         image: {{ .Values.operator.image }}:{{ .Values.operator.tag }}
         imagePullPolicy: {{ .Values.operator.imagePullPolicy }}
         name: manager
