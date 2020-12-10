@@ -62,8 +62,8 @@ jobs:
   publish-chart:
 
     runs-on: ubuntu-latest
-    depends-on: lint-chart
-    
+    needs: lint-chart
+
     steps:
       - name: Checkout
         uses: actions/checkout@v2
