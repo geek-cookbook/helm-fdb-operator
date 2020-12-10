@@ -42,7 +42,7 @@ spec:
           name: metrics
         livenessProbe:
           httpGet:
-            path: /
+            path: /metrics
             port: metrics          
         resources:
           {{- toYaml .Values.resources | nindent 12 }}     
