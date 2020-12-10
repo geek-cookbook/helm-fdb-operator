@@ -3,6 +3,26 @@ entries:
   fdb-operator:
   - apiVersion: v2
     appVersion: 0.24.0
+    created: "2020-12-10T04:27:50.43212057Z"
+    description: A Helm chart for foundationDB operator
+    digest: b72e6676887bfedec699415b53cbce177faffcd37538cf6047ba0efc30445e42
+    home: https://github.com/FoundationDB/fdb-kubernetes-operator
+    maintainers:
+    - email: apps@johnbrownlee.com
+      name: brownleej
+      url: https://github.com/brownleej
+    - email: davidy@funkypenguin.co.nz
+      name: funkypenguin
+      url: https://www.funkypenguin.co.nz
+    name: fdb-operator
+    sources:
+    - https://github.com/FoundationDB/fdb-kubernetes-operator
+    type: application
+    urls:
+    - https://github.com/funkypenguin/fdb-kubernetes-operator/releases/download/fdb-operator-0.24.5/fdb-operator-0.24.5.tgz
+    version: 0.24.5
+  - apiVersion: v2
+    appVersion: 0.24.0
     created: "2020-12-10T04:22:21.803751599Z"
     description: A Helm chart for foundationDB operator
     digest: 1b4502f28dc24508cea95eefbf03490d854a449e2f50351002c93ee7c6268c10
