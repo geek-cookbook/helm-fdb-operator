@@ -11,9 +11,9 @@ metadata:
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   {{- if .Values.operator.globalMode.enabled }}
-  kind: Role
-  {{- else }}
   kind: ClusterRole
+  {{- else }}
+  kind: Role
   {{- end }}
   name: {{ .Values.operator.role }}
 subjects:
