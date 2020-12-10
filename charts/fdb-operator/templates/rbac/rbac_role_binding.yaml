@@ -1,5 +1,9 @@
 apiVersion: rbac.authorization.k8s.io/v1
+{{- if .Values.operator.globalMode.enabled }}
+kind: ClusterRoleBinding
+{{- else }}
 kind: RoleBinding
+{{- end }}
 metadata:
   name: {{ .Values.operator.rolebinding }}
   labels:
