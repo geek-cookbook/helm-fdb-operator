@@ -26,8 +26,9 @@ jobs:
 
       - name: Set up kube-score
         run: |
-          wget https://github.com/zegl/kube-score/releases/download/v1.10.0/kube-score_1.10.0_linux_amd64 -O- kube-score
-
+          wget https://github.com/zegl/kube-score/releases/download/v1.10.0/kube-score_1.10.0_linux_amd64 -O- > kube-score
+          chmod 755 kube-score
+          
       - name: Kube-score generated manifests
         run: helm template helm/fdb-operator | ./kube-score score -
 
