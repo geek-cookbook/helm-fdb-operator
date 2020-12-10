@@ -1,7 +1,7 @@
 # This file sets some opinionated values for kube-score to use
 # when parsing the chart
-image:
-  pullPolicy: Always
+operator:
+  imagePullPolicy: Always
 
 resources:
   requests:
