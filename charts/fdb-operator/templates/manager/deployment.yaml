@@ -12,6 +12,7 @@ metadata:
     {{- include "chart.labels" . | nindent 4 }}
   name: {{ .Values.operator.name }}
 spec:
+  replicas: {{ .Values.operator.replicas }}
   selector:
     matchLabels:
       {{- include "chart.selectorLabels" . | nindent 6 }}
@@ -20,7 +21,6 @@ spec:
       labels:
         {{- include "chart.labels" . | nindent 8 }}
     spec:
-      replicas: {{ .Values.operator.replicas }}
       securityContext:
         runAsUser: 40590
         runAsGroup: 40590
