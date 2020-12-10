@@ -21,7 +21,6 @@ spec:
       labels:
         {{- include "chart.labels" . | nindent 8 }}
     spec:
-      replicas: {{ .Values.operator.replicas }}
       securityContext:
         runAsUser: 40590
         runAsGroup: 40590
