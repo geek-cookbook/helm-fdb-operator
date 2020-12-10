@@ -33,7 +33,7 @@ spec:
         - --enable-leader-election
         command:
         - /manager
-        {{-- if not .Values.operator.globalMode.enabled }}
+        {{- if not .Values.operator.globalMode.enabled }}
         env:
         - name: WATCH_NAMESPACE
           valueFrom:
