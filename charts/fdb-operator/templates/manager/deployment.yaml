@@ -28,6 +28,8 @@ spec:
       volumes:
       - name: tmp
         emptyDir: {}
+      - name: logs
+        emptyDir: {}        
       containers:
       - args:
         - --enable-leader-election
@@ -52,7 +54,9 @@ spec:
             port: metrics   
         volumeMounts:
         - name: tmp
-          mountPath: /tmp       
+          mountPath: /tmp
+        - name: logs
+          mountPath: /var/log/fdb  
         resources:
           {{- toYaml .Values.resources | nindent 12 }}     
         securityContext:
