@@ -87,10 +87,6 @@ RUN curl -LO https://storage.googleapis.com/kubernetes-release/release/${KUBECTL
     && chmod +x ./kubectl \
     && mv ./kubectl /usr/local/bin/kubectl
 
-# cluster config
-RUN mkdir /home/vscode/.kube
-ADD config /home/vscode/.kube/
-
 # skaffold
 RUN curl -Lo skaffold https://storage.googleapis.com/skaffold/releases/latest/skaffold-linux-amd64 \
     && chmod +x skaffold \
@@ -110,13 +106,10 @@ RUN curl -s "https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/
     && mv kustomize /usr/bin/kustomize
 ENV PATH=${PATH}:/usr/local/kubebuilder/bin
 
-RUN curl -fsSL https://download.docker.com/linux/debian/gpg | apt-key add -
-RUN add-apt-repository "deb [arch=amd64] https://download.docker.com/linux/debian  $(lsb_release -cs) stable"
-RUN apt-get -y update \
-    && apt-get -y install docker-ce-cli
-
-# bash config
-ADD .bashrc /home/vscode/
+# fdb-client (yes, we're ignoring SSL certificates here - I have no idea why golang image thinks the cert is untrusted, but I'm sure the Apple team can fix it!)
+RUN curl -k -Lo  foundationdb-clients_6.2.28-1_amd64.deb "https://foundationdb-origin.apple.com/downloads/6.2.28/ubuntu/installers/foundationdb-clients_6.2.28-1_amd64.deb" \
+    && dpkg -i foundationdb-clients_6.2.28-1_amd64.deb \
+    && rm foundationdb-clients_6.2.28-1_amd64.deb
 
 # bash-git-prompt
 RUN git clone https://github.com/magicmonty/bash-git-prompt.git /home/vscode/.bash-git-prompt --depth=1
