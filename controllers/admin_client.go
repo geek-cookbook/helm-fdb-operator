@@ -31,6 +31,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	fdbtypes "github.com/FoundationDB/fdb-kubernetes-operator/api/v1beta1"
@@ -60,9 +61,6 @@ func parseMaxCommandOutput() int {
 type AdminClient interface {
 	// GetStatus gets the database's status
 	GetStatus() (*fdbtypes.FoundationDBStatus, error)
-
-	// GetMinimalStatus gets a one-line summary of the database's status.
-	GetMinimalStatus() (string, error)
 
 	// ConfigureDatabase sets the database configuration
 	ConfigureDatabase(configuration fdbtypes.DatabaseConfiguration, newDatabase bool) error
@@ -177,9 +175,6 @@ type cliCommand struct {
 
 	// args provides alternative arguments in place of the exec command.
 	args []string
-
-	// timeout is the timeout for the CLI.
-	timeout int
 }
 
 // hasTimeoutArg determines whether a command accepts a timeout argument.
@@ -225,11 +220,7 @@ func (client *CliAdminClient) runCommand(command cliCommand) (string, error) {
 	}
 
 	binary := getBinaryPath(binaryName, version)
-	timeout := command.timeout
-	if timeout == 0 {
-		timeout = DefaultCLITimeout
-	}
-	hardTimeout := timeout
+	hardTimeout := DefaultCLITimeout
 	args := make([]string, 0, 9)
 	args = append(args, command.args...)
 	if len(args) == 0 {
@@ -238,7 +229,7 @@ func (client *CliAdminClient) runCommand(command cliCommand) (string, error) {
 
 	args = append(args, command.getClusterFileFlag(), client.clusterFilePath, "--log")
 	if command.hasTimeoutArg() {
-		args = append(args, "--timeout", fmt.Sprintf("%d", timeout))
+		args = append(args, "--timeout", fmt.Sprintf("%d", DefaultCLITimeout))
 		hardTimeout += DefaultCLITimeout
 	}
 	if command.hasDashInLogDir() {
@@ -262,10 +253,12 @@ func (client *CliAdminClient) runCommand(command cliCommand) (string, error) {
 	}
 
 	outputString := string(output)
-	debugOutput := outputString
 
-	if len(debugOutput) > maxCommandOutput && maxCommandOutput > 0 {
-		debugOutput = debugOutput[0:maxCommandOutput] + "..."
+	var debugOutput string
+	if len(outputString) > maxCommandOutput && maxCommandOutput > 0 {
+		debugOutput = outputString[0:maxCommandOutput] + "..."
+	} else {
+		debugOutput = outputString
 	}
 	log.Info("Command completed", "namespace", client.Cluster.Namespace, "cluster", client.Cluster.Name, "output", debugOutput)
 	return outputString, nil
@@ -273,21 +266,11 @@ func (client *CliAdminClient) runCommand(command cliCommand) (string, error) {
 
 // GetStatus gets the database's status
 func (client *CliAdminClient) GetStatus() (*fdbtypes.FoundationDBStatus, error) {
-	statusString, err := client.runCommand(cliCommand{command: "status json"})
-	if err != nil {
-		return nil, err
-	}
-	status := &fdbtypes.FoundationDBStatus{}
-	err = json.Unmarshal([]byte(statusString), &status)
-	if err != nil {
-		return nil, err
-	}
-	return status, nil
-}
-
-// GetMinimalStatus gets a one-line summary of the database's status.
-func (client *CliAdminClient) GetMinimalStatus() (string, error) {
-	return client.runCommand(cliCommand{command: "status minimal"})
+	adminClientMutex.Lock()
+	defer adminClientMutex.Unlock()
+	// This will call directly the database and fetch the status information
+	// from the system key.
+	return getStatusFromDB(client.Cluster)
 }
 
 // ConfigureDatabase sets the database configuration
@@ -425,11 +408,11 @@ func (client *CliAdminClient) CanSafelyRemove(addresses []string) ([]string, err
 // the output of an exclusion command.
 func parseExclusionOutput(output string) map[string]string {
 	results := make(map[string]string)
-	var regex = regexp.MustCompile(`\s*(\[?[\w.:\]?]+)\s*-+(.*)`)
+	var regex = regexp.MustCompile(`\s*(\[?[\w.:\]?]+)(\([\w ]*\))?\s*-+(.*)`)
 	matches := regex.FindAllStringSubmatch(output, -1)
 	for _, match := range matches {
 		address := match[1]
-		status := match[2]
+		status := match[len(match)-1]
 		if strings.Contains(status, "Successfully excluded") {
 			results[address] = "Success"
 		} else if strings.Contains(status, "WARNING: Missing from cluster") {
@@ -617,6 +600,11 @@ func (client *CliAdminClient) GetBackupStatus() (*fdbtypes.FoundationDBLiveBacku
 	}
 
 	status := &fdbtypes.FoundationDBLiveBackupStatus{}
+	statusString, err = removeWarningsInJSON(statusString)
+	if err != nil {
+		return nil, err
+	}
+
 	err = json.Unmarshal([]byte(statusString), &status)
 	if err != nil {
 		return nil, err
@@ -657,6 +645,15 @@ func (client *CliAdminClient) Close() error {
 	return nil
 }
 
+func removeWarningsInJSON(jsonString string) (string, error) {
+	idx := strings.Index(jsonString, "{")
+	if idx == -1 {
+		return "", fmt.Errorf("the JSON string doesn't contain a starting '{'")
+	}
+
+	return strings.TrimSpace(jsonString[idx:]), nil
+}
+
 // MockAdminClient provides a mock implementation of the cluster admin interface
 type MockAdminClient struct {
 	Cluster               *fdbtypes.FoundationDBCluster
@@ -669,10 +666,15 @@ type MockAdminClient struct {
 	Backups               map[string]fdbtypes.FoundationDBBackupStatusBackupDetails
 	restoreURL            string
 	clientVersions        map[string][]string
+	missingProcessGroups  map[string]bool
+	additionalProcesses   []fdbtypes.ProcessGroupStatus
+	localityInfo          map[string]map[string]string
+	incorrectCommandLines map[string]bool
 }
 
 // adminClientCache provides a cache of mock admin clients.
 var adminClientCache = make(map[string]*MockAdminClient)
+var adminClientMutex sync.Mutex
 
 // NewMockAdminClient creates an admin client for a cluster.
 func NewMockAdminClient(cluster *fdbtypes.FoundationDBCluster, kubeClient client.Client) (AdminClient, error) {
@@ -683,17 +685,23 @@ func NewMockAdminClient(cluster *fdbtypes.FoundationDBCluster, kubeClient client
 // nolint:unparam
 // is required because we always return a nil error
 func newMockAdminClientUncast(cluster *fdbtypes.FoundationDBCluster, kubeClient client.Client) (*MockAdminClient, error) {
+	adminClientMutex.Lock()
+	defer adminClientMutex.Unlock()
+
 	client := adminClientCache[cluster.Name]
+
 	if client == nil {
 		client = &MockAdminClient{
-			Cluster:             cluster,
-			KubeClient:          kubeClient,
-			ReincludedAddresses: make(map[string]bool),
+			Cluster:              cluster.DeepCopy(),
+			KubeClient:           kubeClient,
+			ReincludedAddresses:  make(map[string]bool),
+			missingProcessGroups: make(map[string]bool),
+			localityInfo:         make(map[string]map[string]string),
 		}
 		adminClientCache[cluster.Name] = client
 		client.Backups = make(map[string]fdbtypes.FoundationDBBackupStatusBackupDetails)
 	} else {
-		client.Cluster = cluster
+		client.Cluster = cluster.DeepCopy()
 	}
 	return client, nil
 }
@@ -705,6 +713,9 @@ func ClearMockAdminClients() {
 
 // GetStatus gets the database's status
 func (client *MockAdminClient) GetStatus() (*fdbtypes.FoundationDBStatus, error) {
+	adminClientMutex.Lock()
+	defer adminClientMutex.Unlock()
+
 	if client.frozenStatus != nil {
 		return client.frozenStatus, nil
 	}
@@ -745,6 +756,13 @@ func (client *MockAdminClient) GetStatus() (*fdbtypes.FoundationDBStatus, error)
 			return nil, err
 		}
 
+		instance := newFdbInstance(pod)
+		instanceID := instance.GetInstanceID()
+
+		if client.missingProcessGroups[instanceID] {
+			continue
+		}
+
 		for processIndex := 1; processIndex <= processCount; processIndex++ {
 			fullAddress := client.Cluster.GetFullAddress(ip, processIndex)
 
@@ -755,16 +773,22 @@ func (client *MockAdminClient) GetStatus() (*fdbtypes.FoundationDBStatus, error)
 			if isCoordinator && !excluded {
 				coordinators[fullAddress] = true
 			}
-			instance := newFdbInstance(pod)
 			command, err := GetStartCommand(client.Cluster, instance, podClient, processIndex, processCount)
 			if err != nil {
 				return nil, err
+			}
+			if client.incorrectCommandLines != nil && client.incorrectCommandLines[instance.GetInstanceID()] {
+				command += " --locality_incorrect=1"
 			}
 
 			locality := map[string]string{
 				"instance_id": instance.GetInstanceID(),
 				"zoneid":      pod.Name,
 				"dcid":        client.Cluster.Spec.DataCenter,
+			}
+
+			for key, value := range client.localityInfo[instance.GetInstanceID()] {
+				locality[key] = value
 			}
 
 			if processCount > 1 {
@@ -780,6 +804,28 @@ func (client *MockAdminClient) GetStatus() (*fdbtypes.FoundationDBStatus, error)
 				Version:       client.Cluster.Status.RunningVersion,
 				UptimeSeconds: 60000,
 			}
+		}
+
+		for _, processGroup := range client.additionalProcesses {
+			locality := map[string]string{
+				"instance_id": processGroup.ProcessGroupID,
+				"zoneid":      processGroup.ProcessGroupID,
+			}
+
+			for key, value := range client.localityInfo[instance.GetInstanceID()] {
+				locality[key] = value
+			}
+
+			fullAddress := client.Cluster.GetFullAddress(processGroup.Addresses[0], 1)
+
+			status.Cluster.Processes[processGroup.ProcessGroupID] = fdbtypes.FoundationDBStatusProcessInfo{
+				Address:       fullAddress,
+				ProcessClass:  processGroup.ProcessClass,
+				Locality:      locality,
+				Version:       client.Cluster.Status.RunningVersion,
+				UptimeSeconds: 60000,
+			}
+
 		}
 	}
 
@@ -844,13 +890,11 @@ func (client *MockAdminClient) GetStatus() (*fdbtypes.FoundationDBStatus, error)
 	return status, nil
 }
 
-// GetMinimalStatus gets a one-line summary of the database's status.
-func (client *MockAdminClient) GetMinimalStatus() (string, error) {
-	return "The database is available", nil
-}
-
 // ConfigureDatabase changes the database configuration
 func (client *MockAdminClient) ConfigureDatabase(configuration fdbtypes.DatabaseConfiguration, newDatabase bool) error {
+	adminClientMutex.Lock()
+	defer adminClientMutex.Unlock()
+
 	client.DatabaseConfiguration = configuration.DeepCopy()
 	return nil
 }
@@ -858,6 +902,9 @@ func (client *MockAdminClient) ConfigureDatabase(configuration fdbtypes.Database
 // ExcludeInstances starts evacuating processes so that they can be removed
 // from the database.
 func (client *MockAdminClient) ExcludeInstances(addresses []string) error {
+	adminClientMutex.Lock()
+	defer adminClientMutex.Unlock()
+
 	count := len(addresses) + len(client.ExcludedAddresses)
 	exclusionMap := make(map[string]bool, count)
 	newExclusions := make([]string, 0, count)
@@ -891,6 +938,9 @@ func isValidAddress(address string) bool {
 // IncludeInstances removes instances from the exclusion list and allows
 // them to take on roles again.
 func (client *MockAdminClient) IncludeInstances(addresses []string) error {
+	adminClientMutex.Lock()
+	defer adminClientMutex.Unlock()
+
 	newExclusions := make([]string, 0, len(client.ExcludedAddresses))
 	for _, address := range addresses {
 		if !isValidAddress(address) {
@@ -929,18 +979,27 @@ func (client *MockAdminClient) CanSafelyRemove(addresses []string) ([]string, er
 // GetExclusions gets a list of the addresses currently excluded from the
 // database.
 func (client *MockAdminClient) GetExclusions() ([]string, error) {
+	adminClientMutex.Lock()
+	defer adminClientMutex.Unlock()
+
 	return client.ExcludedAddresses, nil
 }
 
 // KillInstances restarts processes
 func (client *MockAdminClient) KillInstances(addresses []string) error {
+	adminClientMutex.Lock()
 	client.KilledAddresses = append(client.KilledAddresses, addresses...)
+	adminClientMutex.Unlock()
+
 	client.UnfreezeStatus()
 	return nil
 }
 
 // ChangeCoordinators changes the coordinator set
 func (client *MockAdminClient) ChangeCoordinators(addresses []string) (string, error) {
+	adminClientMutex.Lock()
+	defer adminClientMutex.Unlock()
+
 	connectionString, err := fdbtypes.ParseConnectionString(client.Cluster.Status.ConnectionString)
 	if err != nil {
 		return "", err
@@ -955,6 +1014,9 @@ func (client *MockAdminClient) ChangeCoordinators(addresses []string) (string, e
 
 // GetConnectionString fetches the latest connection string.
 func (client *MockAdminClient) GetConnectionString() (string, error) {
+	adminClientMutex.Lock()
+	defer adminClientMutex.Unlock()
+
 	return client.Cluster.Status.ConnectionString, nil
 }
 
@@ -981,6 +1043,9 @@ func (client *MockAdminClient) GetProtocolVersion(version string) (string, error
 
 // StartBackup starts a new backup.
 func (client *MockAdminClient) StartBackup(url string, snapshotPeriodSeconds int) error {
+	adminClientMutex.Lock()
+	defer adminClientMutex.Unlock()
+
 	client.Backups["default"] = fdbtypes.FoundationDBBackupStatusBackupDetails{
 		URL:                   url,
 		Running:               true,
@@ -991,6 +1056,9 @@ func (client *MockAdminClient) StartBackup(url string, snapshotPeriodSeconds int
 
 // PauseBackups pauses backups.
 func (client *MockAdminClient) PauseBackups() error {
+	adminClientMutex.Lock()
+	defer adminClientMutex.Unlock()
+
 	for tag, backup := range client.Backups {
 		backup.Paused = true
 		client.Backups[tag] = backup
@@ -1000,6 +1068,9 @@ func (client *MockAdminClient) PauseBackups() error {
 
 // ResumeBackups resumes backups.
 func (client *MockAdminClient) ResumeBackups() error {
+	adminClientMutex.Lock()
+	defer adminClientMutex.Unlock()
+
 	for tag, backup := range client.Backups {
 		backup.Paused = false
 		client.Backups[tag] = backup
@@ -1009,6 +1080,9 @@ func (client *MockAdminClient) ResumeBackups() error {
 
 // ModifyBackup reconfigures the backup.
 func (client *MockAdminClient) ModifyBackup(snapshotPeriodSeconds int) error {
+	adminClientMutex.Lock()
+	defer adminClientMutex.Unlock()
+
 	backup := client.Backups["default"]
 	backup.SnapshotPeriodSeconds = snapshotPeriodSeconds
 	client.Backups["default"] = backup
@@ -1017,6 +1091,9 @@ func (client *MockAdminClient) ModifyBackup(snapshotPeriodSeconds int) error {
 
 // StopBackup stops a backup.
 func (client *MockAdminClient) StopBackup(url string) error {
+	adminClientMutex.Lock()
+	defer adminClientMutex.Unlock()
+
 	for tag, backup := range client.Backups {
 		if backup.URL == url {
 			backup.Running = false
@@ -1029,6 +1106,9 @@ func (client *MockAdminClient) StopBackup(url string) error {
 
 // GetBackupStatus gets the status of the current backup.
 func (client *MockAdminClient) GetBackupStatus() (*fdbtypes.FoundationDBLiveBackupStatus, error) {
+	adminClientMutex.Lock()
+	defer adminClientMutex.Unlock()
+
 	status := &fdbtypes.FoundationDBLiveBackupStatus{}
 
 	tag := "default"
@@ -1045,21 +1125,58 @@ func (client *MockAdminClient) GetBackupStatus() (*fdbtypes.FoundationDBLiveBack
 
 // StartRestore starts a new restore.
 func (client *MockAdminClient) StartRestore(url string) error {
+	adminClientMutex.Lock()
+	defer adminClientMutex.Unlock()
+
 	client.restoreURL = url
 	return nil
 }
 
 // GetRestoreStatus gets the status of the current restore.
 func (client *MockAdminClient) GetRestoreStatus() (string, error) {
+	adminClientMutex.Lock()
+	defer adminClientMutex.Unlock()
+
 	return fmt.Sprintf("%s\n", client.restoreURL), nil
 }
 
 // MockClientVersion returns a mocked client version
 func (client *MockAdminClient) MockClientVersion(version string, clients []string) {
+	adminClientMutex.Lock()
+	defer adminClientMutex.Unlock()
+
 	if client.clientVersions == nil {
 		client.clientVersions = make(map[string][]string)
 	}
 	client.clientVersions[version] = clients
+}
+
+// MockAdditionalProcesses adds additional processes to the cluster status.
+func (client *MockAdminClient) MockAdditionalProcesses(processes []fdbtypes.ProcessGroupStatus) {
+	adminClientMutex.Lock()
+	defer adminClientMutex.Unlock()
+
+	client.additionalProcesses = append(client.additionalProcesses, processes...)
+}
+
+// MockMissingProcessGroup updates the mock for whether a process group should
+// be missing from the cluster status.
+func (client *MockAdminClient) MockMissingProcessGroup(instanceID string, missing bool) {
+	client.missingProcessGroups[instanceID] = missing
+}
+
+// MockLocalityInfo sets mock locality information for a process.
+func (client *MockAdminClient) MockLocalityInfo(processGroupID string, locality map[string]string) {
+	client.localityInfo[processGroupID] = locality
+}
+
+// MockIncorrectCommandLine updates the mock for whether a process group should
+// be have an incorrect command-line.
+func (client *MockAdminClient) MockIncorrectCommandLine(instanceID string, incorrect bool) {
+	if client.incorrectCommandLines == nil {
+		client.incorrectCommandLines = make(map[string]bool)
+	}
+	client.incorrectCommandLines[instanceID] = incorrect
 }
 
 // Close shuts down any resources for the client once it is no longer
@@ -1076,6 +1193,10 @@ func (client *MockAdminClient) FreezeStatus() error {
 	if err != nil {
 		return err
 	}
+
+	adminClientMutex.Lock()
+	defer adminClientMutex.Unlock()
+
 	client.frozenStatus = status
 	return nil
 }
@@ -1083,5 +1204,8 @@ func (client *MockAdminClient) FreezeStatus() error {
 // UnfreezeStatus causes the admin client to start recalculating the status
 // on every call to GetStatus
 func (client *MockAdminClient) UnfreezeStatus() {
+	adminClientMutex.Lock()
+	defer adminClientMutex.Unlock()
+
 	client.frozenStatus = nil
 }

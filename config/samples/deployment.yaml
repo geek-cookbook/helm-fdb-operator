@@ -75,6 +75,18 @@ rules:
   - update
   - patch
   - delete
+- apiGroups:
+  - coordination.k8s.io
+  resources:
+  - leases
+  verbs:
+  - get
+  - list
+  - watch
+  - create
+  - update
+  - patch
+  - delete
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -108,16 +120,14 @@ spec:
         control-plane: controller-manager
     spec:
       containers:
-      - args:
-        - --enable-leader-election
-        command:
+      - command:
         - /manager
         env:
         - name: WATCH_NAMESPACE
           valueFrom:
             fieldRef:
               fieldPath: metadata.namespace
-        image: foundationdb/fdb-kubernetes-operator:0.24.0
+        image: foundationdb/fdb-kubernetes-operator:v0.29.0
         name: manager
         resources:
           limits:
@@ -126,5 +136,23 @@ spec:
           requests:
             cpu: 500m
             memory: 256Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          privileged: false
+          readOnlyRootFilesystem: true
+        volumeMounts:
+        - mountPath: /tmp
+          name: tmp
+        - mountPath: /var/log/fdb
+          name: logs
+      securityContext:
+        fsGroup: 4059
+        runAsGroup: 4059
+        runAsUser: 4059
       serviceAccountName: fdb-kubernetes-operator-controller-manager
       terminationGracePeriodSeconds: 10
+      volumes:
+      - emptyDir: {}
+        name: tmp
+      - emptyDir: {}
+        name: logs

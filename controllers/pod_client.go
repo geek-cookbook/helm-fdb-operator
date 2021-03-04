@@ -32,6 +32,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 
 	fdbtypes "github.com/FoundationDB/fdb-kubernetes-operator/api/v1beta1"
 	corev1 "k8s.io/api/core/v1"
@@ -248,19 +249,31 @@ func NewMockFdbPodClient(cluster *fdbtypes.FoundationDBCluster, pod *corev1.Pod)
 }
 
 var mockMissingPodIPs map[string]bool
+var mockPodClientMutex sync.Mutex
 
 // MockPodIP generates a mock IP for FDB pod
 func MockPodIP(pod *corev1.Pod) string {
+	mockPodClientMutex.Lock()
+	defer mockPodClientMutex.Unlock()
+
 	if mockMissingPodIPs != nil && mockMissingPodIPs[pod.ObjectMeta.Name] {
 		return ""
 	}
 	components := strings.Split(GetInstanceIDFromMeta(pod.ObjectMeta), "-")
 	for index, class := range fdbtypes.ProcessClasses {
-		if class == components[len(components)-2] {
+		if string(class) == components[len(components)-2] {
 			return fmt.Sprintf("1.1.%d.%s", index, components[len(components)-1])
 		}
 	}
 	return "0.0.0.0"
+}
+
+// setMissingPodIPs sets the pod IPs that should be missing when fetching mock
+// pod IPs.
+func setMissingPodIPs(ips map[string]bool) {
+	mockPodClientMutex.Lock()
+	defer mockPodClientMutex.Unlock()
+	mockMissingPodIPs = ips
 }
 
 // GetCluster returns the cluster associated with a client

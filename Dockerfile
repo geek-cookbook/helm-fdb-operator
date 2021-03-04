@@ -1,8 +1,8 @@
 # Build the manager binary
-FROM golang:1.15.5 as builder
+FROM golang:1.15.8 as builder
 
 # Install FDB
-ARG FDB_VERSION=6.2.27
+ARG FDB_VERSION=6.2.29
 ARG FDB_WEBSITE=https://www.foundationdb.org
 
 COPY foundationdb-kubernetes-sidecar/website/ /mnt/website/
@@ -19,7 +19,7 @@ RUN set -eux && \
 	update-ca-certificates --fresh
 
 # Copy 6.2 binaries
-COPY --from=foundationdb/foundationdb:6.2.27 /usr/bin/fdb* /usr/bin/fdb/6.2/
+COPY --from=foundationdb/foundationdb:6.2.29 /usr/bin/fdb* /usr/bin/fdb/6.2/
 
 # Copy 6.1 binaries
 COPY --from=foundationdb/foundationdb:6.1.13 /usr/bin/fdb* /usr/bin/fdb/6.1/
@@ -64,7 +64,8 @@ COPY --from=builder /usr/lib/libfdb_c.so /usr/lib/
 COPY --from=builder /usr/lib/fdb /usr/lib/fdb/
 COPY --chown=fdb:fdb --from=builder /var/log/fdb/.keep /var/log/fdb/.keep
 
-USER 40590
+# Set to the numeric UID of fdb user to satisfy PodSecurityPolices which enforce runAsNonRoot
+USER 4059
 
 ENV FDB_NETWORK_OPTION_TRACE_LOG_GROUP=fdb-kubernetes-operator
 ENV FDB_NETWORK_OPTION_TRACE_ENABLE=/var/log/fdb

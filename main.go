@@ -24,6 +24,7 @@ import (
 	appsv1beta1 "github.com/FoundationDB/fdb-kubernetes-operator/api/v1beta1"
 	"github.com/FoundationDB/fdb-kubernetes-operator/controllers"
 	"github.com/apple/foundationdb/bindings/go/src/fdb"
+	uzap "go.uber.org/zap"
 	"k8s.io/apimachinery/pkg/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	_ "k8s.io/client-go/plugin/pkg/client/auth/gcp"
@@ -47,25 +48,33 @@ func init() {
 func main() {
 	var metricsAddr string
 	var enableLeaderElection bool
+	var leaderElectionID string
 	var logFile string
 	var cliTimeout int
 	var deprecationOptions controllers.DeprecationOptions
 	var useFutureDefaults bool
 	var checkDeprecations bool
+	var development bool
 
 	fdb.MustAPIVersion(610)
 
 	flag.StringVar(&metricsAddr, "metrics-addr", ":8080", "The address the metric endpoint binds to.")
-	flag.BoolVar(&enableLeaderElection, "enable-leader-election", false,
+	flag.BoolVar(&enableLeaderElection, "enable-leader-election", true,
 		"Enable leader election for controller manager. Enabling this will ensure there is only one active controller manager.")
-	flag.StringVar(&logFile, "log-file", "", "The path to a file to write logs to.")
-	flag.IntVar(&cliTimeout, "cli-timeout", 10, "The timeout to use for CLI commands")
+	flag.StringVar(&leaderElectionID, "leader-election-id", "fdb-kubernetes-operator",
+		"LeaderElectionID determines the name of the resource that leader election will use for holding the leader lock.")
 	flag.BoolVar(&deprecationOptions.UseFutureDefaults, "use-future-defaults", false,
 		"Apply defaults from the next major version of the operator. This is only intended for use in development.",
 	)
+	flag.StringVar(&logFile, "log-file", "", "The path to a file to write logs to.")
+	flag.IntVar(&cliTimeout, "cli-timeout", 10, "The timeout to use for CLI commands")
 	flag.BoolVar(&checkDeprecations, "check-deprecations", false,
 		"Check for deprecated fields and then exit",
 	)
+	flag.BoolVar(&development, "development", false,
+		"Enable verbose development logs",
+	)
+	level := uzap.LevelFlag("log-level", uzap.InfoLevel, "The log level")
 	flag.Parse()
 
 	deprecationOptions.OnlyShowChanges = checkDeprecations
@@ -83,10 +92,14 @@ func main() {
 		logWriter = os.Stdout
 	}
 
-	ctrl.SetLogger(zap.New(func(o *zap.Options) {
-		o.Development = true
-		o.DestWritter = logWriter
-	}))
+	logLevel := uzap.NewAtomicLevelAt(*level)
+	ctrl.SetLogger(
+		zap.New(
+			zap.UseDevMode(development),
+			zap.WriteTo(logWriter),
+			zap.Level(&logLevel),
+		),
+	)
 
 	controllers.DefaultCLITimeout = cliTimeout
 
@@ -94,6 +107,7 @@ func main() {
 		Scheme:             scheme,
 		MetricsBindAddress: metricsAddr,
 		LeaderElection:     enableLeaderElection,
+		LeaderElectionID:   leaderElectionID,
 		Port:               9443,
 	}
 
@@ -112,7 +126,6 @@ func main() {
 		Client:              mgr.GetClient(),
 		Recorder:            mgr.GetEventRecorderFor("foundationdbcluster-controller"),
 		Log:                 ctrl.Log.WithName("controllers").WithName("FoundationDBCluster"),
-		Scheme:              mgr.GetScheme(),
 		PodLifecycleManager: controllers.StandardPodLifecycleManager{},
 		PodClientProvider:   controllers.NewFdbPodClient,
 		AdminClientProvider: controllers.NewCliAdminClient,
@@ -121,6 +134,8 @@ func main() {
 		Namespace:           namespace,
 		DeprecationOptions:  deprecationOptions,
 	}
+
+	clusterReconciler.SetScheme(mgr.GetScheme())
 
 	if checkDeprecations {
 		go startCache(mgr)
@@ -141,9 +156,10 @@ func main() {
 		Client:              mgr.GetClient(),
 		Recorder:            mgr.GetEventRecorderFor("foundationdbcluster-controller"),
 		Log:                 ctrl.Log.WithName("controllers").WithName("FoundationDBCluster"),
-		Scheme:              mgr.GetScheme(),
 		AdminClientProvider: controllers.NewCliAdminClient,
 	}
+
+	backupReconciler.SetScheme(mgr.GetScheme())
 
 	if err = backupReconciler.SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "FoundationDBBackup")
@@ -154,9 +170,10 @@ func main() {
 		Client:              mgr.GetClient(),
 		Recorder:            mgr.GetEventRecorderFor("foundationdbrestore-controller"),
 		Log:                 ctrl.Log.WithName("controllers").WithName("FoundationDBRestore"),
-		Scheme:              mgr.GetScheme(),
 		AdminClientProvider: controllers.NewCliAdminClient,
 	}
+
+	restoreReconciler.SetScheme(mgr.GetScheme())
 
 	if err = restoreReconciler.SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "FoundationDBRestore")

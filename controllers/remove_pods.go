@@ -35,27 +35,57 @@ type RemovePods struct{}
 
 // Reconcile runs the reconciler's work.
 func (u RemovePods) Reconcile(r *FoundationDBClusterReconciler, context ctx.Context, cluster *fdbtypes.FoundationDBCluster) (bool, error) {
-	if len(cluster.Status.PendingRemovals) == 0 {
+	processGroupsToRemove := make([]string, 0, len(cluster.Status.ProcessGroups))
+	for _, processGroup := range cluster.Status.ProcessGroups {
+		if processGroup.Remove {
+			excluded := processGroup.Excluded || processGroup.ExclusionSkipped
+			if !excluded {
+				log.Info("Incomplete exclusion still present in RemovePods step. Retrying reconciliation", "namespace", cluster.Namespace, "name", cluster.Name, "instance", processGroup.ProcessGroupID)
+				return false, nil
+			}
+			processGroupsToRemove = append(processGroupsToRemove, processGroup.ProcessGroupID)
+		}
+	}
+
+	if len(processGroupsToRemove) == 0 {
 		return true, nil
 	}
-	r.Recorder.Event(cluster, "Normal", "RemovingProcesses", fmt.Sprintf("Removing pods: %v", cluster.Status.PendingRemovals))
-	for id, state := range cluster.Status.PendingRemovals {
-		if !state.ExclusionComplete {
-			log.Info("Incomplete exclusion still present in RemovePods step. Retrying reconciliation", "namespace", cluster.Namespace, "name", cluster.Name, "instance", id)
-			return false, nil
+
+	if cluster.ShouldUseLocks() {
+		hasLock, err := r.takeLock(cluster, fmt.Sprintf("Removing pods: %v", processGroupsToRemove))
+		if !hasLock {
+			return false, err
 		}
+	}
+
+	r.Recorder.Event(cluster, "Normal", "RemovingProcesses", fmt.Sprintf("Removing pods: %v", processGroupsToRemove))
+	removedProcessGroups := make(map[string]bool)
+	allRemoved := true
+	for _, id := range processGroupsToRemove {
+
 		err := removePod(r, context, cluster, id)
 		if err != nil {
 			return false, err
 		}
 
 		removed, err := confirmPodRemoval(r, context, cluster, id)
-		if !removed {
-			return removed, err
+		if err != nil {
+			return false, err
+		}
+		if removed {
+			removedProcessGroups[id] = true
+		} else {
+			allRemoved = false
+			continue
 		}
 	}
 
-	return true, nil
+	err := includeInstance(r, context, cluster, removedProcessGroups)
+	if err != nil {
+		return false, err
+	}
+
+	return allRemoved, nil
 }
 
 func removePod(r *FoundationDBClusterReconciler, context ctx.Context, cluster *fdbtypes.FoundationDBCluster, instanceID string) error {
@@ -114,7 +144,7 @@ func confirmPodRemoval(r *FoundationDBClusterReconciler, context ctx.Context, cl
 		return false, err
 	}
 	if len(instances) == 1 {
-		log.Info("Waiting for instance get torn down", "namespace", cluster.Namespace, "cluster", cluster.Name, "instanceID", instanceID, "pod", instances[0].Metadata.Name)
+		log.Info("Waiting for instance to get torn down", "namespace", cluster.Namespace, "cluster", cluster.Name, "instanceID", instanceID, "pod", instances[0].Metadata.Name)
 		return false, nil
 	} else if len(instances) > 0 {
 		return false, fmt.Errorf("Multiple pods found for cluster %s, instance ID %s", cluster.Name, instanceID)
@@ -126,7 +156,7 @@ func confirmPodRemoval(r *FoundationDBClusterReconciler, context ctx.Context, cl
 		return false, err
 	}
 	if len(pods.Items) == 1 {
-		log.Info("Waiting for pod get torn down", "namespace", cluster.Namespace, "cluster", cluster.Name, "instanceID", instanceID, "pod", pods.Items[0].Name)
+		log.Info("Waiting for pod to get torn down", "namespace", cluster.Namespace, "cluster", cluster.Name, "instanceID", instanceID, "pod", pods.Items[0].Name)
 		return false, nil
 	} else if len(pods.Items) > 0 {
 		return false, fmt.Errorf("Multiple pods found for cluster %s, instance ID %s", cluster.Name, instanceID)
@@ -138,7 +168,7 @@ func confirmPodRemoval(r *FoundationDBClusterReconciler, context ctx.Context, cl
 		return false, err
 	}
 	if len(pvcs.Items) == 1 {
-		log.Info("Waiting for volume claim get torn down", "namespace", cluster.Namespace, "cluster", cluster.Name, "instanceID", instanceID, "pvc", pvcs.Items[0].Name)
+		log.Info("Waiting for volume claim to get torn down", "namespace", cluster.Namespace, "cluster", cluster.Name, "instanceID", instanceID, "pvc", pvcs.Items[0].Name)
 		return false, nil
 	} else if len(pvcs.Items) > 0 {
 		return false, fmt.Errorf("Multiple PVCs found for cluster %s, instance ID %s", cluster.Name, instanceID)
@@ -150,13 +180,61 @@ func confirmPodRemoval(r *FoundationDBClusterReconciler, context ctx.Context, cl
 		return false, err
 	}
 	if len(services.Items) == 1 {
-		log.Info("Waiting for service get torn down", "namespace", cluster.Namespace, "cluster", cluster.Name, "instanceID", instanceID, "service", services.Items[0].Name)
+		log.Info("Waiting for service to get torn down", "namespace", cluster.Namespace, "cluster", cluster.Name, "instanceID", instanceID, "service", services.Items[0].Name)
 		return false, nil
 	} else if len(services.Items) > 0 {
 		return false, fmt.Errorf("Multiple services found for cluster %s, instance ID %s", cluster.Name, instanceID)
 	}
 
 	return true, nil
+}
+
+func includeInstance(r *FoundationDBClusterReconciler, context ctx.Context, cluster *fdbtypes.FoundationDBCluster, removedProcessGroups map[string]bool) error {
+	adminClient, err := r.AdminClientProvider(cluster, r)
+	if err != nil {
+		return err
+	}
+	defer adminClient.Close()
+
+	addresses := make([]string, 0)
+
+	hasStatusUpdate := false
+
+	processGroups := make([]*fdbtypes.ProcessGroupStatus, 0, len(cluster.Status.ProcessGroups))
+	for _, processGroup := range cluster.Status.ProcessGroups {
+		if processGroup.Remove && removedProcessGroups[processGroup.ProcessGroupID] {
+			addresses = append(addresses, processGroup.Addresses...)
+			hasStatusUpdate = true
+		} else {
+			processGroups = append(processGroups, processGroup)
+		}
+	}
+
+	if len(addresses) > 0 {
+		r.Recorder.Event(cluster, "Normal", "IncludingInstances", fmt.Sprintf("Including removed processes: %v", addresses))
+
+		err = adminClient.IncludeInstances(addresses)
+		if err != nil {
+			return err
+		}
+	}
+
+	if cluster.Spec.PendingRemovals != nil {
+		err := r.clearPendingRemovalsFromSpec(context, cluster)
+		if err != nil {
+			return err
+		}
+	}
+
+	if hasStatusUpdate {
+		cluster.Status.ProcessGroups = processGroups
+		err := r.Status().Update(context, cluster)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 // RequeueAfter returns the delay before we should run the reconciliation

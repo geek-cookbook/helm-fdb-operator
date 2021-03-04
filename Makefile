@@ -3,12 +3,20 @@
 IMG ?= fdb-kubernetes-operator:latest
 
 # Produce CRDs that work back to Kubernetes 1.11 (no version conversion)
-CRD_OPTIONS ?= "crd:trivialVersions=true,maxDescLen=0"
+# TODO (johscheuer): #334
+CRD_OPTIONS ?= "crd:trivialVersions=true,maxDescLen=0,crdVersions=v1beta1"
+GENERATED_CRDS = ./config/crd/bases/apps.foundationdb.org_foundationdbbackups.yaml ./config/crd/bases/apps.foundationdb.org_foundationdbclusters.yaml ./config/crd/bases/apps.foundationdb.org_foundationdbrestores.yaml
 
-CONTROLLER_GEN_VERSION ?= 0.2.4
+CONTROLLER_GEN_VERSION ?= 0.5.0
 
 ifneq "$(FDB_WEBSITE)" ""
 	docker_build_args := $(docker_build_args) --build-arg FDB_WEBSITE=$(FDB_WEBSITE)
+endif
+
+# TAG is used to define the version in the kubectl-fdb plugin.
+# If not defined we use the current git hash.
+ifndef TAG
+	TAG := $(shell git rev-parse HEAD)
 endif
 
 # Get the currently used golang install path (in GOPATH/bin, unless GOBIN is set)
@@ -23,6 +31,10 @@ GENERATED_GO=api/v1beta1/zz_generated.deepcopy.go
 GO_ALL=${GO_SRC} ${GENERATED_GO}
 MANIFESTS=config/crd/bases/apps.foundationdb.org_foundationdbbackups.yaml config/crd/bases/apps.foundationdb.org_foundationdbclusters.yaml config/crd/bases/apps.foundationdb.org_foundationdbrestores.yaml
 CONTROLLER_GEN=$(GOBIN)/controller-gen
+
+ifeq "$(TEST_RACE_CONDITIONS)" "1"
+	go_test_flags := $(go_test_flags) -race
+endif
 
 all: generate fmt vet manager plugin manifests samples documentation test_if_changed
 
@@ -39,14 +51,14 @@ clean:
 # Run tests
 test:
 ifneq "$(SKIP_TEST)" "1"
-	go test ./... -coverprofile cover.out
+	go test ${go_test_flags} ./... -coverprofile cover.out
 endif
 
 test_if_changed: cover.out
 
 cover.out: ${GO_ALL} ${MANIFESTS}
 ifneq "$(SKIP_TEST)" "1"
-	go test ./... -coverprofile cover.out -tags test
+	go test ${go_test_flags} ./... -coverprofile cover.out -tags test
 endif
 
 # Build manager binary
@@ -55,11 +67,18 @@ manager: bin/manager
 bin/manager: ${GO_SRC}
 	go build -o bin/manager main.go
 
+# package the plugin
+package: plugin bin/kubectl-fdb.tar.gz
+
+bin/kubectl-fdb.tar.gz:
+	cp ./kubectl-fdb/Readme.md ./bin
+	(cd ./bin; tar cfvz ./kubectl-fdb.tar.gz ./kubectl-fdb ./Readme.md)
+
 # Build kubectl-fdb binary
 plugin: bin/kubectl-fdb
 
 bin/kubectl-fdb: ${GO_SRC}
-	go build -o bin/kubectl-fdb ./kubectl-fdb
+	go build -ldflags="-s -w -X github.com/FoundationDB/fdb-kubernetes-operator/kubectl-fdb/cmd.pluginVersion=${TAG}" -o bin/kubectl-fdb ./kubectl-fdb
 
 # Run against the configured Kubernetes cluster in ~/.kube/config
 run: generate manifests
@@ -83,6 +102,12 @@ manifests: ${MANIFESTS}
 
 ${MANIFESTS}: ${CONTROLLER_GEN} ${GO_SRC}
 	$(CONTROLLER_GEN) $(CRD_OPTIONS) rbac:roleName=manager-role webhook paths="./..." output:crd:artifacts:config=config/crd/bases
+	# TODO (johscheuer): #524 remove this workaround once we use apiextensions.k8s.io/v1
+	# ref: https://github.com/kubernetes/kubernetes/issues/91395
+	# in v1beta1 defaulting is not allowed so we remove the default value
+	sed -i '/default: TCP/d' $(GENERATED_CRDS)
+	# See: https://github.com/kubernetes-sigs/controller-tools/issues/529
+	sed -i  '/- protocol/d' $(GENERATED_CRDS)
 
 # Run go fmt against code
 fmt: bin/fmt_check

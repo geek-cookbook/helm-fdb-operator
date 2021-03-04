@@ -22,38 +22,66 @@ package controllers
 
 import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	logf "sigs.k8s.io/controller-runtime/pkg/runtime/log"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
+
+	fdbtypes "github.com/FoundationDB/fdb-kubernetes-operator/api/v1beta1"
 )
 
 var log = logf.Log.WithName("controller")
 
-// LastSpecKey provides the annotation name we use to store the hash of the
-// pod spec.
-const LastSpecKey = "foundationdb.org/last-applied-spec"
-
-// LastConfigMapKey provides the annotation name we use to store the hash of the
-// config map.
-const LastConfigMapKey = "foundationdb.org/last-applied-config-map"
-
-// BackupDeploymentLabel provides the label we use to connect backup
-// deployments to a cluster.
-const BackupDeploymentLabel = "foundationdb.org/backup-for"
-
 // DefaultCLITimeout is the default timeout for CLI commands.
 var DefaultCLITimeout = 10
 
-// MinimumUptimeSecondsForBounce defines the minimum time, in seconds, that the
-// processes in the cluster must have been up for before the operator can
-// execute a bounce.
-const MinimumUptimeSecondsForBounce = 600
+const (
+	// LastSpecKey provides the annotation name we use to store the hash of the
+	// pod spec.
+	LastSpecKey = "foundationdb.org/last-applied-spec"
 
-// PublicIPSourceAnnotation is an annotation key that specifies where a pod
-// gets its public IP from.
-const PublicIPSourceAnnotation = "foundationdb.org/public-ip-source"
+	// LastConfigMapKey provides the annotation name we use to store the hash of the
+	// config map.
+	LastConfigMapKey = "foundationdb.org/last-applied-config-map"
 
-// PublicIPAnnotation is an annotation key that specifies the current public
-// IP for a pod.
-const PublicIPAnnotation = "foundationdb.org/public-ip"
+	// BackupDeploymentLabel provides the label we use to connect backup
+	// deployments to a cluster.
+	BackupDeploymentLabel = "foundationdb.org/backup-for"
+
+	// MinimumUptimeSecondsForBounce defines the minimum time, in seconds, that the
+	// processes in the cluster must have been up for before the operator can
+	// execute a bounce.
+	MinimumUptimeSecondsForBounce = 600
+
+	// PublicIPSourceAnnotation is an annotation key that specifies where a pod
+	// gets its public IP from.
+	PublicIPSourceAnnotation = "foundationdb.org/public-ip-source"
+
+	// PublicIPAnnotation is an annotation key that specifies the current public
+	// IP for a pod.
+	PublicIPAnnotation = "foundationdb.org/public-ip"
+
+	// FDBInstanceIDLabel represents the label that is used to represent a instance ID
+	FDBInstanceIDLabel = "fdb-instance-id"
+
+	// FDBProcessClassLabel represents the label that is used to represent the process class
+	FDBProcessClassLabel = "fdb-process-class"
+
+	// FDBClusterLabel represents the label that is used to represent the cluster of an instance
+	FDBClusterLabel = "fdb-cluster-name"
+
+	// NodeSelectorNoScheduleLabel is a label used when adding node selectors to block scheduling.
+	NodeSelectorNoScheduleLabel = "foundationdb.org/no-schedule-allowed"
+
+	// FDBLocalityInstanceIDKey represents the key in the locality map that
+	// holds the instance ID.
+	FDBLocalityInstanceIDKey = "instance_id"
+
+	// FDBLocalityZoneIDKey represents the key in the locality map that holds
+	// the zone ID.
+	FDBLocalityZoneIDKey = "zoneid"
+
+	// FDBLocalityDCIDKey represents the key in the locality map that holds
+	// the DC ID.
+	FDBLocalityDCIDKey = "dcid"
+)
 
 // metadataMatches determines if the current metadata on an object matches the
 // metadata specified by the cluster spec.
@@ -61,26 +89,39 @@ func metadataMatches(currentMetadata metav1.ObjectMeta, desiredMetadata metav1.O
 	return containsAll(currentMetadata.Labels, desiredMetadata.Labels) && containsAll(currentMetadata.Annotations, desiredMetadata.Annotations)
 }
 
+// mergeLabels merges the the labels specified by the operator into
+// on object's metadata.
+//
+// This will return whether the target's labels have changed.
+func mergeLabelsInMetadata(target *metav1.ObjectMeta, desired metav1.ObjectMeta) bool {
+	return mergeMap(target.Labels, desired.Labels)
+}
+
 // mergeAnnotations merges the the annotations specified by the operator into
 // on object's metadata.
 //
 // This will return whether the target's annotations have changed.
 func mergeAnnotations(target *metav1.ObjectMeta, desired metav1.ObjectMeta) bool {
-	if desired.Annotations == nil {
-		return false
-	}
-	if target.Annotations == nil {
-		target.Annotations = desired.Annotations
-		return true
-	}
+	return mergeMap(target.Annotations, desired.Annotations)
+}
+
+// mergeMap merges a map into another map.
+//
+// This will return whether the target's values have changed.
+func mergeMap(target map[string]string, desired map[string]string) bool {
 	changed := false
-	for key, value := range desired.Annotations {
-		if target.Annotations[key] != value {
-			target.Annotations[key] = value
+	for key, value := range desired {
+		if target[key] != value {
+			target[key] = value
 			changed = true
 		}
 	}
 	return changed
+}
+
+// processClassFromLabel extracts the ProcessClass label from the metav1.ObjectMeta.Labels map
+func processClassFromLabels(labels map[string]string) fdbtypes.ProcessClass {
+	return fdbtypes.ProcessClass(labels[FDBProcessClassLabel])
 }
 
 // DeprecationOptions controls how deprecations and changes to defaults

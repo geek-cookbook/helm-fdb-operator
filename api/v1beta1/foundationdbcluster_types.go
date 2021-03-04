@@ -78,7 +78,7 @@ type FoundationDBClusterSpec struct {
 	DatabaseConfiguration `json:"databaseConfiguration,omitempty"`
 
 	// Processes defines process-level settings.
-	Processes map[string]ProcessSettings `json:"processes,omitempty"`
+	Processes map[ProcessClass]ProcessSettings `json:"processes,omitempty"`
 
 	// ProcessCounts defines the number of processes to configure for each
 	// process class. You can generally omit this, to allow the operator to
@@ -121,7 +121,7 @@ type FoundationDBClusterSpec struct {
 	// format.
 	TrustedCAs []string `json:"trustedCAs,omitempty"`
 
-	// SidecarVariables defines Ccustom variables that the sidecar should make
+	// SidecarVariables defines Custom variables that the sidecar should make
 	// available for substitution in the monitor conf file.
 	SidecarVariables []string `json:"sidecarVariables,omitempty"`
 
@@ -140,6 +140,10 @@ type FoundationDBClusterSpec struct {
 
 	// InstanceIDPrefix defines a prefix to append to the instance IDs in the
 	// locality fields.
+	//
+	// This must be a valid Kubernetes label value. See
+	// https://kubernetes.io/docs/concepts/overview/working-with-objects/labels/#syntax-and-character-set
+	// for more details on that.
 	InstanceIDPrefix string `json:"instanceIDPrefix,omitempty"`
 
 	// UpdatePodsByReplacement determines whether we should update pod config
@@ -156,6 +160,9 @@ type FoundationDBClusterSpec struct {
 	// IgnoreUpgradabilityChecks determines whether we should skip the check for
 	// client compatibility when performing an upgrade.
 	IgnoreUpgradabilityChecks bool `json:"ignoreUpgradabilityChecks,omitempty"`
+
+	// Buggify defines settings for injecting faults into a cluster for testing.
+	Buggify BuggifyConfig `json:"buggify,omitempty"`
 
 	// SidecarVersion defines the build version of the sidecar to use.
 	//
@@ -266,6 +273,7 @@ type FoundationDBClusterSpec struct {
 type FoundationDBClusterStatus struct {
 	// ProcessCounts defines the number of processes that are currently running
 	// in the cluster.
+	// Deprecated: Use ProcessGroups instead.
 	ProcessCounts `json:"processCounts,omitempty"`
 
 	// IncorrectProcesses provides the processes that do not have the correct
@@ -273,23 +281,27 @@ type FoundationDBClusterStatus struct {
 	//
 	// This will map the instance ID to the timestamp when we observed the
 	// incorrect configuration.
+	// Deprecated: Use ProcessGroups instead.
 	IncorrectProcesses map[string]int64 `json:"incorrectProcesses,omitempty"`
 
 	// IncorrectPods provides the pods that do not have the correct
 	// spec.
 	//
 	// This will contain the name of the pod.
+	// Deprecated: Use ProcessGroups instead.
 	IncorrectPods []string `json:"incorrectPods,omitempty"`
 
 	// FailingPods provides the pods that are not starting correctly.
 	//
 	// This will contain the name of the pod.
+	// Deprecated: Use ProcessGroups instead.
 	FailingPods []string `json:"failingPods,omitempty"`
 
 	// MissingProcesses provides the processes that are not reporting to the
 	// cluster.
 	// This will map the names of the pod to the timestamp when we observed
 	// that the process was missing.
+	// Deprecated: Use ProcessGroups instead.
 	MissingProcesses map[string]int64 `json:"missingProcesses,omitempty"`
 
 	// DatabaseConfiguration provides the running configuration of the database.
@@ -330,6 +342,7 @@ type FoundationDBClusterStatus struct {
 
 	// PendingRemovals defines the processes that are pending removal.
 	// This maps the instance ID to its removal state.
+	// Deprecated: Use ProcessGroups instead.
 	PendingRemovals map[string]PendingRemovalState `json:"pendingRemovals,omitempty"`
 
 	// NeedsSidecarConfInConfigMap determines whether we need to include the
@@ -340,7 +353,264 @@ type FoundationDBClusterStatus struct {
 	// StorageServersPerDisk defines the storageServersPerPod observed in the cluster.
 	// If there are more than one value in the slice the reconcile phase is not finished.
 	StorageServersPerDisk []int `json:"storageServersPerDisk,omitempty"`
+
+	// ProcessGroups contain information about a process group.
+	// This information is used in multiple places to trigger the according action.
+	ProcessGroups []*ProcessGroupStatus `json:"processGroups,omitempty"`
+
+	// Locks contains information about the locking system.
+	Locks LockSystemStatus `json:"locks,omitempty"`
 }
+
+// LockSystemStatus provides a summary of the status of the locking system.
+type LockSystemStatus struct {
+	// DenyList contains a list of operator instances that are prevented
+	// from taking locks.
+	DenyList []string `json:"lockDenyList,omitempty"`
+}
+
+// ProcessGroupStatus represents a the status of a ProcessGroup.
+type ProcessGroupStatus struct {
+	// ProcessGroupID represents the ID of the process group
+	ProcessGroupID string `json:"processGroupID,omitempty"`
+	// ProcessClass represents the class the process group has.
+	ProcessClass ProcessClass `json:"processClass,omitempty"`
+	// Addresses represents the list of addresses the process group has been known to have.
+	Addresses []string `json:"addresses,omitempty"`
+	// Remove defines if the process group is marked for removal.
+	Remove bool `json:"remove,omitempty"`
+	// Excluded defines if the process group has been fully excluded.
+	// This is only used within the reconciliation process, and should not be considered authoritative.
+	Excluded bool `json:"excluded,omitempty"`
+	// ExclusionSkipped determines if exclusion has been skipped for a process, which will allow the process group to be removed without exclusion.
+	ExclusionSkipped bool `json:"exclusionSkipped,omitempty"`
+	// ProcessGroupConditions represents a list of degraded conditions that the process group is in.
+	ProcessGroupConditions []*ProcessGroupCondition `json:"processGroupConditions,omitempty"`
+}
+
+// NewProcessGroupStatus returns a new GroupStatus for the given processGroupID and processClass.
+func NewProcessGroupStatus(processGroupID string, processClass ProcessClass, addresses []string) *ProcessGroupStatus {
+	return &ProcessGroupStatus{
+		ProcessGroupID:         processGroupID,
+		ProcessClass:           processClass,
+		Addresses:              addresses,
+		Remove:                 false,
+		Excluded:               false,
+		ProcessGroupConditions: make([]*ProcessGroupCondition, 0),
+	}
+}
+
+// FindProcessGroupByID finds a process group status for a given processGroupID.
+func FindProcessGroupByID(processGroups []*ProcessGroupStatus, processGroupID string) *ProcessGroupStatus {
+	for _, processGroup := range processGroups {
+		if processGroup.ProcessGroupID == processGroupID {
+			return processGroup
+		}
+	}
+
+	return nil
+}
+
+// ContainsProcessGroupID evaluates if the ProcessGroupStatus contains a given processGroupID.
+func ContainsProcessGroupID(processGroups []*ProcessGroupStatus, processGroupID string) bool {
+	return FindProcessGroupByID(processGroups, processGroupID) != nil
+}
+
+// MarkProcessGroupForRemoval sets the remove flag for the given process and ensures that the address is added.
+func MarkProcessGroupForRemoval(processGroups []*ProcessGroupStatus, processGroupID string, processClass ProcessClass, address string) (bool, *ProcessGroupStatus) {
+	for _, processGroup := range processGroups {
+		if processGroup.ProcessGroupID != processGroupID {
+			continue
+		}
+
+		hasAddress := false
+		for _, addr := range processGroup.Addresses {
+			if addr != address {
+				continue
+			}
+
+			hasAddress = true
+			break
+		}
+
+		if !hasAddress && address != "" {
+			processGroup.Addresses = append(processGroup.Addresses, address)
+		}
+
+		processGroup.Remove = true
+		return true, nil
+	}
+
+	var addresses []string
+	if address == "" {
+		addresses = nil
+	} else {
+		addresses = []string{address}
+	}
+
+	processGroup := NewProcessGroupStatus(processGroupID, processClass, addresses)
+	processGroup.Remove = true
+
+	return false, processGroup
+}
+
+// UpdateCondition will add or remove a condition in the ProcessGroupStatus.
+// If the old ProcessGroupStatus already contains the condition, and the condition is being set,
+// the condition is reused to contain the same timestamp.
+func (processGroupStatus *ProcessGroupStatus) UpdateCondition(conditionType ProcessGroupConditionType, set bool, oldProcessGroups []*ProcessGroupStatus, processGroupID string) {
+	if set {
+		processGroupStatus.addCondition(oldProcessGroups, processGroupID, conditionType)
+	} else {
+		processGroupStatus.removeCondition(conditionType)
+	}
+}
+
+// addCondition will add the condition to the ProcessGroupStatus.
+// If the old ProcessGroupStatus already contains the condition the condition is reused to contain the same timestamp.
+func (processGroupStatus *ProcessGroupStatus) addCondition(oldProcessGroups []*ProcessGroupStatus, processGroupID string, conditionType ProcessGroupConditionType) {
+	var oldProcessGroupStatus *ProcessGroupStatus
+
+	// Check if we got a ProcessGroupStatus for the processGroupID
+	for _, oldGroupStatus := range oldProcessGroups {
+		if oldGroupStatus.ProcessGroupID != processGroupID {
+			continue
+		}
+
+		oldProcessGroupStatus = oldGroupStatus
+		break
+	}
+
+	// Check if we got a condition for the condition type for the ProcessGroupStatus
+	if oldProcessGroupStatus != nil {
+		for _, condition := range oldProcessGroupStatus.ProcessGroupConditions {
+			if condition.ProcessGroupConditionType == conditionType {
+				// We found a condition with the above condition type
+				processGroupStatus.ProcessGroupConditions = append(processGroupStatus.ProcessGroupConditions, condition)
+				return
+			}
+		}
+	}
+
+	// Check if we already got this condition in the current ProcessGroupStatus
+	for _, condition := range processGroupStatus.ProcessGroupConditions {
+		if condition.ProcessGroupConditionType == conditionType {
+			return
+		}
+	}
+
+	// We didn't find any condition so we create a new one
+	processGroupStatus.ProcessGroupConditions = append(processGroupStatus.ProcessGroupConditions, NewProcessGroupCondition(conditionType))
+}
+
+// removeCondition will remove a condition from the ProcessGroupStatus, if it is
+// present.
+func (processGroupStatus *ProcessGroupStatus) removeCondition(conditionType ProcessGroupConditionType) {
+	conditions := make([]*ProcessGroupCondition, 0, len(processGroupStatus.ProcessGroupConditions))
+	for _, condition := range processGroupStatus.ProcessGroupConditions {
+		if condition.ProcessGroupConditionType != conditionType {
+			conditions = append(conditions, condition)
+		}
+	}
+	processGroupStatus.ProcessGroupConditions = conditions
+}
+
+// CreateProcessCountsFromProcessGroupStatus creates a ProcessCounts struct from the current ProcessGroupStatus.
+func CreateProcessCountsFromProcessGroupStatus(processGroupStatus []*ProcessGroupStatus, includeRemovals bool) ProcessCounts {
+	processCounts := ProcessCounts{}
+
+	for _, groupStatus := range processGroupStatus {
+		if !groupStatus.Remove || includeRemovals {
+			processCounts.IncreaseCount(groupStatus.ProcessClass, 1)
+		}
+	}
+
+	return processCounts
+}
+
+// FilterByCondition returns a string slice of all ProcessGroupIDs that contains a condition with the given type.
+func FilterByCondition(processGroupStatus []*ProcessGroupStatus, conditionType ProcessGroupConditionType) []string {
+	result := make([]string, 0)
+
+	for _, groupStatus := range processGroupStatus {
+		for _, condition := range groupStatus.ProcessGroupConditions {
+			if condition.ProcessGroupConditionType != conditionType {
+				continue
+			}
+
+			result = append(result, groupStatus.ProcessGroupID)
+			break
+		}
+	}
+
+	return result
+}
+
+// ProcessGroupsByProcessClass returns a slice of all Process Groups that contains a given process class.
+func (clusterStatus FoundationDBClusterStatus) ProcessGroupsByProcessClass(processClass ProcessClass) []*ProcessGroupStatus {
+	result := make([]*ProcessGroupStatus, 0)
+
+	for _, groupStatus := range clusterStatus.ProcessGroups {
+		if groupStatus.ProcessClass == processClass {
+			result = append(result, groupStatus)
+		}
+
+	}
+
+	return result
+}
+
+// GetConditionTime returns the timestamp when we detected a condition on a
+// process group.
+// If there is no matching condition this will return nil.
+func (processGroupStatus *ProcessGroupStatus) GetConditionTime(conditionType ProcessGroupConditionType) *int64 {
+	for _, condition := range processGroupStatus.ProcessGroupConditions {
+		if condition.ProcessGroupConditionType == conditionType {
+			return &condition.Timestamp
+		}
+	}
+
+	return nil
+}
+
+// NewProcessGroupCondition creates a new ProcessGroupCondition of the given time with the current timestamp.
+func NewProcessGroupCondition(conditionType ProcessGroupConditionType) *ProcessGroupCondition {
+	return &ProcessGroupCondition{
+		ProcessGroupConditionType: conditionType,
+		Timestamp:                 time.Now().Unix(),
+	}
+}
+
+// ProcessGroupCondition represents a degraded condition that a process group is in.
+type ProcessGroupCondition struct {
+	// Name of the condition
+	ProcessGroupConditionType ProcessGroupConditionType `json:"type,omitempty"`
+	// Timestamp when the Condition was observed
+	Timestamp int64 `json:"timestamp,omitempty"`
+}
+
+// ProcessGroupConditionType represents a concrete ProcessGroupCondition.
+type ProcessGroupConditionType string
+
+const (
+	// NotConnecting represents a process group that doesn't connect to the cluster.
+	NotConnecting ProcessGroupConditionType = "NotConnecting"
+	// IncorrectPodSpec represents a process group that has an incorrect Pod spec.
+	IncorrectPodSpec ProcessGroupConditionType = "IncorrectPodSpec"
+	// IncorrectConfigMap represents a process group that has an incorrect ConfigMap.
+	IncorrectConfigMap ProcessGroupConditionType = "IncorrectConfigMap"
+	// IncorrectCommandLine represents a process group that has an incorrect commandline configuration.
+	IncorrectCommandLine ProcessGroupConditionType = "IncorrectCommandLine"
+	// PodFailing represents a process group which Pod keeps failing.
+	PodFailing ProcessGroupConditionType = "PodFailing"
+	// MissingPod represents a process group that doesn't have a Pod assigned.
+	MissingPod ProcessGroupConditionType = "MissingPod"
+	// MissingPVC represents a process group that doesn't have a PVC assigned.
+	MissingPVC ProcessGroupConditionType = "MissingPVC"
+	// MissingService represents a process group that doesn't have a Service assigned.
+	MissingService ProcessGroupConditionType = "MissingService"
+	// MissingProcesses represents a process group that misses a process.
+	MissingProcesses ProcessGroupConditionType = "MissingProcesses"
+)
 
 // ClusterGenerationStatus stores information on which generations have reached
 // different stages in reconciliation for the cluster.
@@ -405,7 +675,16 @@ type ClusterGenerationStatus struct {
 
 	// HasFailingPods provides the last generation that has pods that are
 	// failing to start.
+	// Deprecated: This is no longer used.
 	HasFailingPods int64 `json:"hasFailingPods,omitempty"`
+
+	// HasUnhealthyProcess provides the last generation that has at least one
+	// process group with a negative condition.
+	HasUnhealthyProcess int64 `json:"hasUnhealthyProcess,omitempty"`
+
+	// NeedsLockConfigurationChanges provides the last generation that is
+	// pending a change to the configuration of the locking system.
+	NeedsLockConfigurationChanges int64 `json:"needsLockConfigurationChanges,omitempty"`
 }
 
 // ClusterHealth represents different views into health in the cluster status.
@@ -426,6 +705,7 @@ type ClusterHealth struct {
 }
 
 // PendingRemovalState holds information about a process that is being removed.
+// Deprecated: This is modeled in the process group status instead.
 type PendingRemovalState struct {
 	// The name of the pod that is being removed.
 	PodName string `json:"podName,omitempty"`
@@ -455,8 +735,8 @@ type RoleCounts struct {
 }
 
 // Map returns a map from process classes to the desired count for that role
-func (counts RoleCounts) Map() map[string]int {
-	countMap := make(map[string]int, len(roleIndices))
+func (counts RoleCounts) Map() map[ProcessClass]int {
+	countMap := make(map[ProcessClass]int, len(roleIndices))
 	countValue := reflect.ValueOf(counts)
 	for role, index := range roleIndices {
 		if role != ProcessClassStorage {
@@ -519,8 +799,8 @@ type ProcessCounts struct {
 
 // Map returns a map from process classes to the number of processes with that
 // class.
-func (counts ProcessCounts) Map() map[string]int {
-	countMap := make(map[string]int, len(processClassIndices))
+func (counts ProcessCounts) Map() map[ProcessClass]int {
+	countMap := make(map[ProcessClass]int, len(processClassIndices))
 	countValue := reflect.ValueOf(counts)
 	for processClass, index := range processClassIndices {
 		value := int(countValue.Field(index).Int())
@@ -532,7 +812,7 @@ func (counts ProcessCounts) Map() map[string]int {
 }
 
 // IncreaseCount adds to one of the process counts based on the name.
-func (counts *ProcessCounts) IncreaseCount(name string, amount int) {
+func (counts *ProcessCounts) IncreaseCount(name ProcessClass, amount int) {
 	index, present := processClassIndices[name]
 	if present {
 		countValue := reflect.ValueOf(counts)
@@ -542,7 +822,7 @@ func (counts *ProcessCounts) IncreaseCount(name string, amount int) {
 }
 
 // DecreaseCount adds to one of the process counts based on the name.
-func (counts *ProcessCounts) DecreaseCount(name string, amount int) {
+func (counts *ProcessCounts) DecreaseCount(name ProcessClass, amount int) {
 	index, present := processClassIndices[name]
 	if present {
 		countValue := reflect.ValueOf(counts)
@@ -552,26 +832,25 @@ func (counts *ProcessCounts) DecreaseCount(name string, amount int) {
 }
 
 // fieldNames provides the names of fields on a structure.
-func fieldNames(value interface{}) []string {
+func fieldNames(value interface{}) []ProcessClass {
 	countType := reflect.TypeOf(value)
-	names := make([]string, 0, countType.NumField())
+	names := make([]ProcessClass, 0, countType.NumField())
 	for index := 0; index < countType.NumField(); index++ {
 		tag := strings.Split(countType.Field(index).Tag.Get("json"), ",")
-		names = append(names, tag[0])
+		names = append(names, ProcessClass(tag[0]))
 	}
 	return names
 }
 
 // fieldIndices provides a map from the names of fields in a structure to the
 // index of each field in the list of fields.
-func fieldIndices(value interface{}) map[string]int {
+func fieldIndices(value interface{}, result interface{}, keyType reflect.Type) {
 	countType := reflect.TypeOf(value)
-	indices := make(map[string]int, countType.NumField())
+	resultValue := reflect.ValueOf(result)
 	for index := 0; index < countType.NumField(); index++ {
 		tag := strings.Split(countType.Field(index).Tag.Get("json"), ",")
-		indices[tag[0]] = index
+		resultValue.SetMapIndex(reflect.ValueOf(tag[0]).Convert(keyType), reflect.ValueOf(index))
 	}
-	return indices
 }
 
 // ProcessClasses provides a consistent ordered list of the supported process
@@ -580,17 +859,23 @@ var ProcessClasses = fieldNames(ProcessCounts{})
 
 // processClassIndices provides the indices of each process class in the list
 // of process classes.
-var processClassIndices = fieldIndices(ProcessCounts{})
+var processClassIndices = make(map[ProcessClass]int)
 
 // roleNames provides a consistent ordered list of the supported roles.
 var roleNames = fieldNames(RoleCounts{})
 
 // roleIndices provides the indices of each role in the list of roles.
-var roleIndices = fieldIndices(RoleCounts{})
+var roleIndices = make(map[ProcessClass]int)
 
 // versionFlagIndices provides the indices of each flag in the list of supported
 // version flags..
-var versionFlagIndices = fieldIndices(VersionFlags{})
+var versionFlagIndices = make(map[string]int)
+
+func init() {
+	fieldIndices(ProcessCounts{}, processClassIndices, reflect.TypeOf(ProcessClassStorage))
+	fieldIndices(RoleCounts{}, roleIndices, reflect.TypeOf(ProcessClassStorage))
+	fieldIndices(VersionFlags{}, versionFlagIndices, reflect.TypeOf(""))
+}
 
 // FoundationDBClusterAutomationOptions provides flags for enabling or disabling
 // operations that can be performed on a cluster.
@@ -606,6 +891,23 @@ type FoundationDBClusterAutomationOptions struct {
 	// DeletePods defines whether the operator is allowed to delete pods in
 	// order to recreate them.
 	DeletePods *bool `json:"deletePods,omitempty"`
+
+	// Replacements contains options for automatically replacing failed
+	// processes.
+	Replacements AutomaticReplacementOptions `json:"replacements,omitempty"`
+}
+
+// AutomaticReplacementOptions controls options for automatically replacing
+// failed processes.
+type AutomaticReplacementOptions struct {
+	// Enabled controls whether automatic replacements are enabled.
+	// The default is false.
+	Enabled *bool `json:"enabled,omitempty"`
+
+	// FailureDetectionTimeSeconds controls how long a process must be
+	// failed or missing before it is automatically replaced.
+	// The default is 1800 seconds, or 30 minutes.
+	FailureDetectionTimeSeconds *int `json:"failureDetectionTimeSeconds,omitempty"`
 }
 
 // ProcessSettings defines process-level settings.
@@ -629,7 +931,7 @@ type ProcessSettings struct {
 }
 
 // GetProcessSettings gets settings for a process.
-func (cluster *FoundationDBCluster) GetProcessSettings(processClass string) ProcessSettings {
+func (cluster *FoundationDBCluster) GetProcessSettings(processClass ProcessClass) ProcessSettings {
 	merged := ProcessSettings{}
 	entries := make([]ProcessSettings, 0, 2)
 
@@ -638,7 +940,7 @@ func (cluster *FoundationDBCluster) GetProcessSettings(processClass string) Proc
 		entries = append(entries, entry)
 	}
 
-	entries = append(entries, cluster.Spec.Processes["general"])
+	entries = append(entries, cluster.Spec.Processes[ProcessClassGeneral])
 
 	for _, entry := range entries {
 		if merged.PodTemplate == nil {
@@ -877,22 +1179,13 @@ func (cluster *FoundationDBCluster) CheckReconciliation() (bool, error) {
 
 	cluster.Status.Generations = ClusterGenerationStatus{Reconciled: cluster.Status.Generations.Reconciled}
 
-	if len(cluster.Status.PendingRemovals) > 0 {
-		needsShrink := false
-		for _, state := range cluster.Status.PendingRemovals {
-			if !state.ExclusionComplete {
-				needsShrink = true
-			}
-		}
-		if needsShrink {
+	for _, processGroup := range cluster.Status.ProcessGroups {
+		if processGroup.Remove && !processGroup.Excluded {
 			cluster.Status.Generations.NeedsShrink = cluster.ObjectMeta.Generation
 			reconciled = false
-		} else {
+		} else if processGroup.Remove {
 			cluster.Status.Generations.HasPendingRemoval = cluster.ObjectMeta.Generation
 		}
-	} else if len(cluster.Spec.PendingRemovals) > 0 {
-		cluster.Status.Generations.NeedsShrink = cluster.ObjectMeta.Generation
-		reconciled = false
 	}
 
 	desiredCounts, err := cluster.GetProcessCountsWithDefaults()
@@ -900,7 +1193,9 @@ func (cluster *FoundationDBCluster) CheckReconciliation() (bool, error) {
 		return false, err
 	}
 
-	diff := desiredCounts.diff(cluster.Status.ProcessCounts)
+	currentCounts := CreateProcessCountsFromProcessGroupStatus(cluster.Status.ProcessGroups, false)
+
+	diff := desiredCounts.diff(currentCounts)
 
 	for _, delta := range diff {
 		if delta > 0 {
@@ -912,19 +1207,11 @@ func (cluster *FoundationDBCluster) CheckReconciliation() (bool, error) {
 		}
 	}
 
-	if len(cluster.Status.IncorrectProcesses) > 0 {
-		cluster.Status.Generations.NeedsMonitorConfUpdate = cluster.ObjectMeta.Generation
-		reconciled = false
-	}
-
-	if len(cluster.Status.IncorrectPods) > 0 {
-		cluster.Status.Generations.NeedsPodDeletion = cluster.ObjectMeta.Generation
-		reconciled = false
-	}
-
-	if len(cluster.Status.FailingPods) > 0 {
-		cluster.Status.Generations.HasFailingPods = cluster.ObjectMeta.Generation
-		reconciled = false
+	for _, processGroup := range cluster.Status.ProcessGroups {
+		if len(processGroup.ProcessGroupConditions) > 0 {
+			cluster.Status.Generations.HasUnhealthyProcess = cluster.ObjectMeta.Generation
+			reconciled = false
+		}
 	}
 
 	if !cluster.Status.Health.Available {
@@ -965,9 +1252,38 @@ func (cluster *FoundationDBCluster) CheckReconciliation() (bool, error) {
 		reconciled = false
 	}
 
+	lockDenyMap := make(map[string]bool, len(cluster.Spec.LockOptions.DenyList))
+	for _, denyListEntry := range cluster.Spec.LockOptions.DenyList {
+		lockDenyMap[denyListEntry.ID] = denyListEntry.Allow
+	}
+
+	for _, denyListID := range cluster.Status.Locks.DenyList {
+		allow, present := lockDenyMap[denyListID]
+		if !present {
+			continue
+		}
+		if allow {
+			cluster.Status.Generations.NeedsLockConfigurationChanges = cluster.ObjectMeta.Generation
+			reconciled = false
+		} else {
+			delete(lockDenyMap, denyListID)
+		}
+	}
+
+	for _, allow := range lockDenyMap {
+		if !allow {
+			cluster.Status.Generations.NeedsLockConfigurationChanges = cluster.ObjectMeta.Generation
+			reconciled = false
+			break
+		}
+	}
+
 	if reconciled {
 		cluster.Status.Generations.Reconciled = cluster.ObjectMeta.Generation
+	} else if cluster.Status.Generations.Reconciled == cluster.ObjectMeta.Generation {
+		cluster.Status.Generations.Reconciled = 0
 	}
+
 	return reconciled, nil
 }
 
@@ -987,8 +1303,8 @@ func (counts ProcessCounts) CountsAreSatisfied(currentCounts ProcessCounts) bool
 }
 
 // diff gets the diff between two sets of process counts.
-func (counts ProcessCounts) diff(currentCounts ProcessCounts) map[string]int64 {
-	diff := make(map[string]int64)
+func (counts ProcessCounts) diff(currentCounts ProcessCounts) map[ProcessClass]int64 {
+	diff := make(map[ProcessClass]int64)
 	desiredValue := reflect.ValueOf(counts)
 	currentValue := reflect.ValueOf(currentCounts)
 	for label, index := range processClassIndices {
@@ -1071,7 +1387,7 @@ type FoundationDBStatusProcessInfo struct {
 	Address string `json:"address,omitempty"`
 
 	// ProcessClass provides the process class the process has been given.
-	ProcessClass string `json:"class_type,omitempty"`
+	ProcessClass ProcessClass `json:"class_type,omitempty"`
 
 	// CommandLine provides the command-line invocation for the process.
 	CommandLine string `json:"command_line,omitempty"`
@@ -1577,7 +1893,6 @@ func (cluster *FoundationDBCluster) IsBeingUpgraded() bool {
 
 // InstanceIsBeingRemoved determines if an instance is pending removal.
 func (cluster *FoundationDBCluster) InstanceIsBeingRemoved(instanceID string) bool {
-
 	if cluster.Status.PendingRemovals != nil {
 		_, present := cluster.Status.PendingRemovals[instanceID]
 		if present {
@@ -1601,6 +1916,12 @@ func (cluster *FoundationDBCluster) InstanceIsBeingRemoved(instanceID string) bo
 
 	for _, id := range cluster.Spec.InstancesToRemoveWithoutExclusion {
 		if id == instanceID {
+			return true
+		}
+	}
+
+	for _, status := range cluster.Status.ProcessGroups {
+		if status.ProcessGroupID == instanceID && status.Remove {
 			return true
 		}
 	}
@@ -1648,6 +1969,16 @@ func (cluster *FoundationDBCluster) GetLockID() string {
 func (cluster *FoundationDBCluster) NeedsExplicitListenAddress() bool {
 	source := cluster.Spec.Services.PublicIPSource
 	return source != nil && *source == PublicIPSourceService
+}
+
+// GetPublicIPSource returns the set PublicIPSource or the default PublicIPSourcePod
+func (cluster *FoundationDBCluster) GetPublicIPSource() PublicIPSource {
+	source := cluster.Spec.Services.PublicIPSource
+	if source == nil {
+		return PublicIPSourcePod
+	}
+
+	return *source
 }
 
 // FillInDefaultsFromStatus adds in missing fields from the database
@@ -2009,6 +2340,19 @@ type LockOptions struct {
 	// LockDurationMinutes determines the duration that locks should be valid
 	// for.
 	LockDurationMinutes *int `json:"lockDurationMinutes,omitempty"`
+
+	// DenyList manages configuration for whether an instance of the operator
+	// should be denied from taking locks.
+	DenyList []LockDenyListEntry `json:"denyList,omitempty"`
+}
+
+// LockDenyListEntry models an entry in the deny list for the locking system.
+type LockDenyListEntry struct {
+	// The ID of the operator instance this entry is targeting.
+	ID string `json:"id,omitempty"`
+
+	// Whether the instance is allowed to take locks.
+	Allow bool `json:"allow,omitempty"`
 }
 
 // ServiceConfig allows configuring services that sit in front of our pods.
@@ -2032,6 +2376,12 @@ type RequiredAddressSet struct {
 
 	// NonTLS defines whether we need to listen on a non-TLS address.
 	NonTLS bool `json:"nonTLS,omitempty"`
+}
+
+// BuggifyConfig provides options for injecting faults into a cluster for testing.
+type BuggifyConfig struct {
+	// NoSchedule defines a list of instance IDs that should fail to schedule.
+	NoSchedule []string `json:"noSchedule,omitempty"`
 }
 
 // FdbVersion represents a version of FoundationDB.
@@ -2169,13 +2519,22 @@ const (
 	PublicIPSourceService PublicIPSource = "service"
 )
 
+// ProcessClass models the role of a pod
+type ProcessClass string
+
 const (
 	// ProcessClassStorage model for FDB class storage
-	ProcessClassStorage = "storage"
+	ProcessClassStorage ProcessClass = "storage"
 	// ProcessClassLog model for FDB class log
-	ProcessClassLog = "log"
+	ProcessClassLog ProcessClass = "log"
 	// ProcessClassTransaction model for FDB class transaction
-	ProcessClassTransaction = "transaction"
+	ProcessClassTransaction ProcessClass = "transaction"
+	// ProcessClassStateless model for FDB stateless processes
+	ProcessClassStateless ProcessClass = "stateless"
+	// ProcessClassGeneral model for FDB general processes
+	ProcessClassGeneral ProcessClass = "general"
+	// ProcessClassClusterController model for FDB class cluster_controller
+	ProcessClassClusterController ProcessClass = "cluster_controller"
 )
 
 // AddStorageServerPerDisk adds serverPerDisk to the status field to keep track which ConfigMaps should be kept

@@ -35,60 +35,83 @@ type ChooseRemovals struct{}
 func (c ChooseRemovals) Reconcile(r *FoundationDBClusterReconciler, context ctx.Context, cluster *fdbtypes.FoundationDBCluster) (bool, error) {
 	hasNewRemovals := false
 
-	var removals = cluster.Status.PendingRemovals
-
-	if removals == nil {
-		removals = make(map[string]fdbtypes.PendingRemovalState)
+	var removals = make(map[string]bool)
+	for _, processGroup := range cluster.Status.ProcessGroups {
+		if processGroup.Remove {
+			removals[processGroup.ProcessGroupID] = true
+		}
 	}
 
-	currentCounts := cluster.Status.ProcessCounts.Map()
+	currentCounts := fdbtypes.CreateProcessCountsFromProcessGroupStatus(cluster.Status.ProcessGroups, true).Map()
 	desiredCountStruct, err := cluster.GetProcessCountsWithDefaults()
 	if err != nil {
 		return false, err
 	}
 	desiredCounts := desiredCountStruct.Map()
 
+	adminClient, err := r.AdminClientProvider(cluster, r)
+	if err != nil {
+		return false, err
+	}
+	status, err := adminClient.GetStatus()
+	if err != nil {
+		return false, err
+	}
+	localityMap := make(map[string]localityInfo)
+	for _, process := range status.Cluster.Processes {
+		id := process.Locality[FDBLocalityInstanceIDKey]
+		localityMap[id] = localityInfo{ID: id, Address: process.Address, LocalityData: process.Locality}
+	}
+
+	remainingProcessMap := make(map[string]bool, len(cluster.Status.ProcessGroups))
+
 	for _, processClass := range fdbtypes.ProcessClasses {
 		desiredCount := desiredCounts[processClass]
-		instances, err := r.PodLifecycleManager.GetInstances(r, cluster, context, getPodListOptions(cluster, processClass, "")...)
-		if err != nil {
-			return false, err
-		}
-
-		if desiredCount < 0 {
-			desiredCount = 0
-		}
 
 		removedCount := currentCounts[processClass] - desiredCount
+
+		processClassLocality := make([]localityInfo, 0, currentCounts[processClass])
+
+		for _, processGroup := range cluster.Status.ProcessGroupsByProcessClass(processClass) {
+			if processGroup.Remove {
+				removedCount--
+			} else {
+				locality, present := localityMap[processGroup.ProcessGroupID]
+				if present {
+					processClassLocality = append(processClassLocality, locality)
+				}
+			}
+		}
+
 		if removedCount > 0 {
-			err = sortInstancesByID(instances)
+			r.Recorder.Event(cluster, "Normal", "ShrinkingProcesses", fmt.Sprintf("Removing %d %s processes", removedCount, processClass))
+
+			remainingProcesses, err := chooseDistributedProcesses(processClassLocality, desiredCount, processSelectionConstraint{})
 			if err != nil {
 				return false, err
 			}
 
-			r.Recorder.Event(cluster, "Normal", "RemovingProcesses", fmt.Sprintf("Removing %d %s processes", removedCount, processClass))
+			log.Info("Chose remaining processes after shrink", "desiredCount", desiredCount, "options", processClassLocality, "selected", remainingProcesses)
 
-			removalsChosen := 0
-			for indexOfPod := 0; indexOfPod < len(instances) && removalsChosen < removedCount; indexOfPod++ {
-				instance := instances[len(instances)-1-indexOfPod]
-				instanceID := instance.GetInstanceID()
-				_, beingRemoved := removals[instanceID]
-				if !beingRemoved {
-					removalState := r.getPendingRemovalState(instance)
-
-					removals[instanceID] = removalState
-
-					removalsChosen++
-				}
+			for _, localityInfo := range remainingProcesses {
+				remainingProcessMap[localityInfo.ID] = true
 			}
+
 			hasNewRemovals = true
-			cluster.Status.ProcessCounts.IncreaseCount(processClass, -1*removalsChosen)
+		} else {
+			for _, localityInfo := range processClassLocality {
+				remainingProcessMap[localityInfo.ID] = true
+			}
 		}
 	}
 
 	if hasNewRemovals {
-		cluster.Status.PendingRemovals = removals
-		err := r.updatePendingRemovals(context, cluster)
+		for _, processGroup := range cluster.Status.ProcessGroups {
+			if !remainingProcessMap[processGroup.ProcessGroupID] {
+				processGroup.Remove = true
+			}
+		}
+		err := r.Status().Update(context, cluster)
 		if err != nil {
 			return false, err
 		}

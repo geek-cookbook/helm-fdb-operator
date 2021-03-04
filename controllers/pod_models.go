@@ -40,14 +40,14 @@ var processClassSanitizationPattern = regexp.MustCompile("[^a-z0-9-]")
 // getInstanceID generates an ID for an instance.
 //
 // This will return the pod name and the instance ID.
-func getInstanceID(cluster *fdbtypes.FoundationDBCluster, processClass string, idNum int) (string, string) {
+func getInstanceID(cluster *fdbtypes.FoundationDBCluster, processClass fdbtypes.ProcessClass, idNum int) (string, string) {
 	var instanceID string
 	if cluster.Spec.InstanceIDPrefix != "" {
 		instanceID = fmt.Sprintf("%s-%s-%d", cluster.Spec.InstanceIDPrefix, processClass, idNum)
 	} else {
 		instanceID = fmt.Sprintf("%s-%d", processClass, idNum)
 	}
-	return fmt.Sprintf("%s-%s-%d", cluster.Name, processClassSanitizationPattern.ReplaceAllString(processClass, "-"), idNum), instanceID
+	return fmt.Sprintf("%s-%s-%d", cluster.Name, processClassSanitizationPattern.ReplaceAllString(string(processClass), "-"), idNum), instanceID
 }
 
 func generateServicePorts(processesPerPod int) []corev1.ServicePort {
@@ -77,7 +77,7 @@ func generateServicePorts(processesPerPod int) []corev1.ServicePort {
 }
 
 // GetService builds a service for a new instance
-func GetService(cluster *fdbtypes.FoundationDBCluster, processClass string, idNum int) (*corev1.Service, error) {
+func GetService(cluster *fdbtypes.FoundationDBCluster, processClass fdbtypes.ProcessClass, idNum int) (*corev1.Service, error) {
 	name, id := getInstanceID(cluster, processClass, idNum)
 
 	owner := buildOwnerReference(cluster.TypeMeta, cluster.ObjectMeta)
@@ -94,15 +94,16 @@ func GetService(cluster *fdbtypes.FoundationDBCluster, processClass string, idNu
 	return &corev1.Service{
 		ObjectMeta: metadata,
 		Spec: corev1.ServiceSpec{
-			Type:     corev1.ServiceTypeClusterIP,
-			Ports:    generateServicePorts(processesPerPod),
-			Selector: getMinimalSinglePodLabels(cluster, id),
+			Type:                     corev1.ServiceTypeClusterIP,
+			Ports:                    generateServicePorts(processesPerPod),
+			PublishNotReadyAddresses: true,
+			Selector:                 getMinimalSinglePodLabels(cluster, id),
 		},
 	}, nil
 }
 
 // GetPod builds a pod for a new instance
-func GetPod(cluster *fdbtypes.FoundationDBCluster, processClass string, idNum int) (*corev1.Pod, error) {
+func GetPod(cluster *fdbtypes.FoundationDBCluster, processClass fdbtypes.ProcessClass, idNum int) (*corev1.Pod, error) {
 	name, id := getInstanceID(cluster, processClass, idNum)
 
 	owner := buildOwnerReference(cluster.TypeMeta, cluster.ObjectMeta)
@@ -150,7 +151,7 @@ func getImage(imageName, curImage, defaultImage, versionString string) (string, 
 }
 
 // GetPodSpec builds a pod spec for a FoundationDB pod
-func GetPodSpec(cluster *fdbtypes.FoundationDBCluster, processClass string, idNum int) (*corev1.PodSpec, error) {
+func GetPodSpec(cluster *fdbtypes.FoundationDBCluster, processClass fdbtypes.ProcessClass, idNum int) (*corev1.PodSpec, error) {
 	processSettings := cluster.GetProcessSettings(processClass)
 	podSpec := processSettings.PodTemplate.Spec.DeepCopy()
 
@@ -318,13 +319,32 @@ func GetPodSpec(cluster *fdbtypes.FoundationDBCluster, processClass string, idNu
 						PodAffinityTerm: corev1.PodAffinityTerm{
 							TopologyKey: faultDomainKey,
 							LabelSelector: &metav1.LabelSelector{MatchLabels: map[string]string{
-								"fdb-cluster-name":  cluster.ObjectMeta.Name,
-								"fdb-process-class": processClass,
+								FDBClusterLabel:      cluster.ObjectMeta.Name,
+								FDBProcessClassLabel: string(processClass),
 							}},
 						},
 					},
 				},
 			},
+		}
+	}
+
+	for _, noScheduleInstanceID := range cluster.Spec.Buggify.NoSchedule {
+		if instanceID == noScheduleInstanceID {
+			if affinity == nil {
+				affinity = &corev1.Affinity{}
+			}
+			if affinity.NodeAffinity == nil {
+				affinity.NodeAffinity = &corev1.NodeAffinity{}
+			}
+			if affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution == nil {
+				affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution = &corev1.NodeSelector{}
+			}
+			affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms = append(affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms, corev1.NodeSelectorTerm{
+				MatchExpressions: []corev1.NodeSelectorRequirement{{
+					Key: NodeSelectorNoScheduleLabel, Operator: corev1.NodeSelectorOpIn, Values: []string{"true"},
+				}},
+			})
 		}
 	}
 
@@ -548,14 +568,14 @@ func configureSidecarContainer(container *corev1.Container, initMode bool, insta
 }
 
 // usePvc determines whether we should attach a PVC to a pod.
-func usePvc(cluster *fdbtypes.FoundationDBCluster, processClass string) bool {
+func usePvc(cluster *fdbtypes.FoundationDBCluster, processClass fdbtypes.ProcessClass) bool {
 	var storage *resource.Quantity
 	processSettings := cluster.GetProcessSettings(processClass)
 
 	if processSettings.VolumeClaimTemplate != nil {
 		requests := processSettings.VolumeClaimTemplate.Spec.Resources.Requests
 		if requests != nil {
-			storageCopy := requests["storage"]
+			storageCopy := requests[corev1.ResourceStorage]
 			storage = &storageCopy
 		}
 	}
@@ -563,12 +583,12 @@ func usePvc(cluster *fdbtypes.FoundationDBCluster, processClass string) bool {
 }
 
 // isStateful determines whether a process class should store data.
-func isStateful(processClass string) bool {
+func isStateful(processClass fdbtypes.ProcessClass) bool {
 	return processClass == fdbtypes.ProcessClassStorage || processClass == fdbtypes.ProcessClassLog || processClass == fdbtypes.ProcessClassTransaction
 }
 
 // GetPvc builds a persistent volume claim for a FoundationDB instance.
-func GetPvc(cluster *fdbtypes.FoundationDBCluster, processClass string, idNum int) (*corev1.PersistentVolumeClaim, error) {
+func GetPvc(cluster *fdbtypes.FoundationDBCluster, processClass fdbtypes.ProcessClass, idNum int) (*corev1.PersistentVolumeClaim, error) {
 	if !usePvc(cluster, processClass) {
 		return nil, nil
 	}
@@ -597,9 +617,9 @@ func GetPvc(cluster *fdbtypes.FoundationDBCluster, processClass string, idNum in
 		pvc.Spec.Resources.Requests = corev1.ResourceList{}
 	}
 
-	storage := pvc.Spec.Resources.Requests["storage"]
+	storage := pvc.Spec.Resources.Requests[corev1.ResourceStorage]
 	if (&storage).IsZero() {
-		pvc.Spec.Resources.Requests["storage"] = resource.MustParse("128G")
+		pvc.Spec.Resources.Requests[corev1.ResourceStorage] = resource.MustParse("128G")
 	}
 
 	specHash, err := GetJSONHash(pvc.Spec)
@@ -889,40 +909,40 @@ func customizeContainerFromList(containers []corev1.Container, name string, cust
 // settings.
 func ensurePodTemplatePresent(spec *fdbtypes.FoundationDBClusterSpec) {
 	if spec.Processes == nil {
-		spec.Processes = make(map[string]fdbtypes.ProcessSettings)
+		spec.Processes = make(map[fdbtypes.ProcessClass]fdbtypes.ProcessSettings)
 	}
-	generalSettings := spec.Processes["general"]
+	generalSettings := spec.Processes[fdbtypes.ProcessClassGeneral]
 	if generalSettings.PodTemplate == nil {
 		generalSettings.PodTemplate = &corev1.PodTemplateSpec{}
 	}
-	spec.Processes["general"] = generalSettings
+	spec.Processes[fdbtypes.ProcessClassGeneral] = generalSettings
 }
 
 // ensureCustomParametersPresent defines custom parameters for the general process
 // settings.
 func ensureCustomParametersPresent(spec *fdbtypes.FoundationDBClusterSpec) {
 	if spec.Processes == nil {
-		spec.Processes = make(map[string]fdbtypes.ProcessSettings)
+		spec.Processes = make(map[fdbtypes.ProcessClass]fdbtypes.ProcessSettings)
 	}
-	generalSettings := spec.Processes["general"]
+	generalSettings := spec.Processes[fdbtypes.ProcessClassGeneral]
 	if generalSettings.CustomParameters == nil {
 		params := make([]string, 0)
 		generalSettings.CustomParameters = &params
 	}
-	spec.Processes["general"] = generalSettings
+	spec.Processes[fdbtypes.ProcessClassGeneral] = generalSettings
 }
 
 // ensureVolumeClaimPresent defines a volume claim in the general process
 // settings.
 func ensureVolumeClaimPresent(spec *fdbtypes.FoundationDBClusterSpec) {
 	if spec.Processes == nil {
-		spec.Processes = make(map[string]fdbtypes.ProcessSettings)
+		spec.Processes = make(map[fdbtypes.ProcessClass]fdbtypes.ProcessSettings)
 	}
-	generalSettings := spec.Processes["general"]
+	generalSettings := spec.Processes[fdbtypes.ProcessClassGeneral]
 	if generalSettings.VolumeClaimTemplate == nil {
 		generalSettings.VolumeClaimTemplate = &corev1.PersistentVolumeClaim{}
 	}
-	spec.Processes["general"] = generalSettings
+	spec.Processes[fdbtypes.ProcessClassGeneral] = generalSettings
 }
 
 // ensureConfigMapPresent defines a config map in the cluster spec.
@@ -987,11 +1007,11 @@ func updateVolumeClaims(spec *fdbtypes.FoundationDBClusterSpec, customizer func(
 func NormalizeClusterSpec(spec *fdbtypes.FoundationDBClusterSpec, options DeprecationOptions) error {
 	if spec.PodTemplate != nil {
 		ensurePodTemplatePresent(spec)
-		generalSettings := spec.Processes["general"]
+		generalSettings := spec.Processes[fdbtypes.ProcessClassGeneral]
 		if reflect.DeepEqual(generalSettings.PodTemplate, &corev1.PodTemplateSpec{}) {
 			generalSettings.PodTemplate = spec.PodTemplate
 		}
-		spec.Processes["general"] = generalSettings
+		spec.Processes[fdbtypes.ProcessClassGeneral] = generalSettings
 		spec.PodTemplate = nil
 	}
 
@@ -1005,13 +1025,13 @@ func NormalizeClusterSpec(spec *fdbtypes.FoundationDBClusterSpec, options Deprec
 
 	if spec.VolumeClaim != nil {
 		if spec.Processes == nil {
-			spec.Processes = make(map[string]fdbtypes.ProcessSettings)
+			spec.Processes = make(map[fdbtypes.ProcessClass]fdbtypes.ProcessSettings)
 		}
-		generalSettings := spec.Processes["general"]
+		generalSettings := spec.Processes[fdbtypes.ProcessClassGeneral]
 		if generalSettings.VolumeClaimTemplate == nil {
 			generalSettings.VolumeClaimTemplate = spec.VolumeClaim.DeepCopy()
 		}
-		spec.Processes["general"] = generalSettings
+		spec.Processes[fdbtypes.ProcessClassGeneral] = generalSettings
 		spec.VolumeClaim = nil
 	}
 
@@ -1112,7 +1132,7 @@ func NormalizeClusterSpec(spec *fdbtypes.FoundationDBClusterSpec, options Deprec
 			if volumeClaim.Spec.Resources.Requests == nil {
 				volumeClaim.Spec.Resources.Requests = corev1.ResourceList{}
 			}
-			volumeClaim.Spec.Resources.Requests["storage"] = storageQuantity
+			volumeClaim.Spec.Resources.Requests[corev1.ResourceStorage] = storageQuantity
 		})
 		spec.VolumeSize = ""
 	}
@@ -1172,6 +1192,16 @@ func NormalizeClusterSpec(spec *fdbtypes.FoundationDBClusterSpec, options Deprec
 			source := fdbtypes.PublicIPSourcePod
 			spec.Services.PublicIPSource = &source
 		}
+
+		if spec.AutomationOptions.Replacements.Enabled == nil {
+			enabled := false
+			spec.AutomationOptions.Replacements.Enabled = &enabled
+		}
+
+		if spec.AutomationOptions.Replacements.FailureDetectionTimeSeconds == nil {
+			duration := 1800
+			spec.AutomationOptions.Replacements.FailureDetectionTimeSeconds = &duration
+		}
 	}
 
 	// Apply changes between old and new defaults.
@@ -1227,6 +1257,10 @@ func getStorageServersPerPodForInstance(instance *FdbInstance) (int, error) {
 func getStorageServersPerPodForPod(pod *corev1.Pod) (int, error) {
 	// If not specified we will default to 1
 	storageServersPerPod := 1
+	if pod == nil {
+		return storageServersPerPod, nil
+	}
+
 	for _, container := range pod.Spec.Containers {
 		for _, env := range container.Env {
 			if env.Name == "STORAGE_SERVERS_PER_POD" {

@@ -1,3 +1,34 @@
+# v0.27.0
+
+* Check if instance contains Pod before continuing operation.
+* Add a timeout to the transactions for managing locks.
+* Add an exec subcommand for the kubectl plugin.
+* Move tracking of removal state into the process group status.
+* Fix typo in spec.
+
+# v0.26.0
+
+*	Replace some hardcoded strings with named constants.
+*	Add security contexts to the sample operator deployments.
+*	Fix handling of exclusion output from whole-machine exclusions on FDB 6.3.
+*	Fix a bug with calculating the storage servers per pod for a missing pod.
+*	Fix handling of the default namespace in the kubectl plugin commands.
+
+# v0.25.0
+
+*	Add docs for StorageClass and multiple storage servers per pod.
+*	Add kubectl plugin for fdb.
+*	Add liveness probe to helm chart.
+*	Allow customization of pod resources in help chart.
+*	Add a design for automating replacements.
+*	Pin kustomize version.
+*	Add option to helm chart for "global mode".
+*	Allow override of deployment replicas value.
+*	Add unit tests for plugin.
+*	Fix bug to update storageServerPerPod.
+*	Add custom parameters to backup agents.
+*	Enable golint to check for shadowing.
+
 # v0.24.0
 
 *	Use the locking system to coordinate exclusions and bounces.

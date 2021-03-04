@@ -40,7 +40,6 @@ var _ = Describe("restore_controller", func() {
 	var err error
 
 	BeforeEach(func() {
-		ClearMockAdminClients()
 		cluster = createDefaultCluster()
 		restore = createDefaultRestore(cluster)
 		adminClient, err = newMockAdminClientUncast(cluster, k8sClient)
@@ -53,29 +52,29 @@ var _ = Describe("restore_controller", func() {
 			err = k8sClient.Create(context.TODO(), cluster)
 			Expect(err).NotTo(HaveOccurred())
 
-			Eventually(func() (int64, error) {
-				return reloadCluster(cluster)
-			}).ShouldNot(Equal(int64(0)))
+			result, err := reconcileCluster(cluster)
+			Expect(err).NotTo((HaveOccurred()))
+			Expect(result.Requeue).To(BeFalse())
+
+			generation, err := reloadCluster(cluster)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(generation).NotTo(Equal(int64(0)))
 			err = k8sClient.Get(context.TODO(), types.NamespacedName{Namespace: cluster.Namespace, Name: cluster.Name}, cluster)
 			Expect(err).NotTo(HaveOccurred())
 
 			err = k8sClient.Create(context.TODO(), restore)
 			Expect(err).NotTo(HaveOccurred())
-			Eventually(func() (bool, error) {
-				err := reloadRestore(restore)
-				if err != nil {
-					return false, err
-				}
-				return restore.Status.Running, nil
-			}).Should(BeTrue())
+
+			result, err = reconcileRestore(restore)
+			Expect(err).NotTo((HaveOccurred()))
+			Expect(result.Requeue).To(BeFalse())
+
+			err = reloadRestore(restore)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(restore.Status.Running).To(BeTrue())
 
 			err = k8sClient.Get(context.TODO(), types.NamespacedName{Namespace: cluster.Namespace, Name: cluster.Name}, cluster)
 			Expect(err).NotTo(HaveOccurred())
-		})
-
-		AfterEach(func() {
-			cleanupCluster(cluster)
-			cleanupRestore(restore)
 		})
 
 		Context("when reconciling a new restore", func() {

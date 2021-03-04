@@ -21,155 +21,39 @@
 package cmd
 
 import (
-	"fmt"
-	"log"
-
-	"github.com/FoundationDB/fdb-kubernetes-operator/controllers"
-	corev1 "k8s.io/api/core/v1"
+	"k8s.io/cli-runtime/pkg/genericclioptions"
 
 	"github.com/spf13/cobra"
-	"k8s.io/apimachinery/pkg/runtime"
-	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
-	"sigs.k8s.io/controller-runtime/pkg/client"
-
-	ctx "context"
-
-	fdbtypes "github.com/FoundationDB/fdb-kubernetes-operator/api/v1beta1"
 )
 
-// removeCmd represents the removal of one or multiple instances in a given cluster
-var removeCmd = &cobra.Command{
-	Use:   "remove",
-	Short: "Adds an instance (or multiple) to the remove list of the given cluster",
-	Long:  "Adds an instance (or multiple) to the remove list field of the given cluster",
-	Run: func(cmd *cobra.Command, args []string) {
-		namespace, err := rootCmd.Flags().GetString("namespace")
-		if err != nil {
-			log.Fatal(err)
-		}
-		kubeconfig, err := rootCmd.Flags().GetString("kubeconfig")
-		if err != nil {
-			log.Fatal(err)
-		}
-		force, err := rootCmd.Flags().GetBool("force")
-		if err != nil {
-			log.Fatal(err)
-		}
+func newRemoveCmd(streams genericclioptions.IOStreams, rootCmd *cobra.Command) *cobra.Command {
+	o := NewFDBOptions(streams)
 
-		cluster, err := cmd.Flags().GetString("cluster")
-		if err != nil {
-			log.Fatal(err)
-		}
-		instances, err := cmd.Flags().GetStringSlice("instances")
-		if err != nil {
-			log.Fatal(err)
-		}
-		withExclusion, err := cmd.Flags().GetBool("exclusion")
-		if err != nil {
-			log.Fatal(err)
-		}
-		withShrink, err := cmd.Flags().GetBool("shrink")
-		if err != nil {
-			log.Fatal(err)
-		}
-
-		config := getConfig(kubeconfig)
-
-		scheme := runtime.NewScheme()
-		_ = clientgoscheme.AddToScheme(scheme)
-		_ = fdbtypes.AddToScheme(scheme)
-
-		kubeClient, err := client.New(config, client.Options{Scheme: scheme})
-		if err != nil {
-			log.Fatal(err)
-		}
-
-		removeInstances(kubeClient, cluster, instances, namespace, withExclusion, withShrink, force)
-	},
-	Example: `
+	cmd := &cobra.Command{
+		Use:   "remove",
+		Short: "Subcommand to remove instances from a given cluster",
+		Long:  "Subcommand to remove instances from a given cluster",
+		RunE: func(c *cobra.Command, args []string) error {
+			return c.Help()
+		},
+		Example: `
 # Remove instances for a cluster in the current namespace
-kubectl fdb remove -c cluster -i instance-1 -i instance-2
+kubectl fdb remove instances -c cluster pod-1 -i pod-2
 
 # Remove instances for a cluster in the namespace default
-kubectl fdb -n default remove -c cluster -i instance-1 -i instance-2
+kubectl fdb -n default remove instances -c cluster pod-1 pod-2
+
+# Remove instances for a cluster with the instance ID.
+# The instance ID of a Pod can be fetched with "kubectl get po -L fdb-instance-id"
+kubectl fdb -n default remove instances --use-instance-id -c cluster storage-1 storage-2
 `,
-}
-
-// removeInstances adds instances to the instancesToRemove field
-func removeInstances(kubeClient client.Client, clusterName string, instances []string, namespace string, withExclusion bool, withShrink bool, force bool) {
-	if len(instances) == 0 {
-		return
 	}
+	cmd.SetOut(o.Out)
+	cmd.SetErr(o.ErrOut)
+	cmd.SetIn(o.In)
 
-	shrinkMap := make(map[string]int)
+	cmd.AddCommand(newRemoveInstancesCmd(streams, rootCmd))
+	o.configFlags.AddFlags(cmd.Flags())
 
-	if withShrink {
-		var pods corev1.PodList
-		err := kubeClient.List(ctx.Background(), &pods,
-			client.InNamespace(namespace),
-			client.MatchingLabels(map[string]string{
-				"fdb-cluster-name": clusterName,
-			}))
-
-		if err != nil {
-			log.Fatal(err)
-		}
-
-		for _, pod := range pods.Items {
-			class := controllers.GetProcessClassFromMeta(pod.ObjectMeta)
-			shrinkMap[class]++
-		}
-	}
-
-	var cluster fdbtypes.FoundationDBCluster
-	err := kubeClient.Get(ctx.Background(), client.ObjectKey{
-		Namespace: namespace,
-		Name:      clusterName,
-	}, &cluster)
-
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	for class, amount := range shrinkMap {
-		cluster.Spec.ProcessCounts.DecreaseCount(class, amount)
-	}
-
-	if !force {
-		confirmed := confirmAction(fmt.Sprintf("Remove %v from cluster %s/%s with exclude: %t and shrink: %t", instances, namespace, clusterName, withExclusion, withShrink))
-		if !confirmed {
-			print("Abort")
-			return
-		}
-	}
-
-	if withExclusion {
-		cluster.Spec.InstancesToRemove = append(cluster.Spec.InstancesToRemove, instances...)
-	} else {
-		cluster.Spec.InstancesToRemoveWithoutExclusion = append(cluster.Spec.InstancesToRemoveWithoutExclusion, instances...)
-	}
-
-	err = kubeClient.Update(ctx.TODO(), &cluster)
-	if err != nil {
-		log.Fatal(err)
-	}
-}
-
-func init() {
-	removeCmd.Flags().StringP("cluster", "c", "", "remove instance(s) from the provided cluster.")
-	removeCmd.Flags().StringSliceP("instances", "i", []string{}, "instances to be removed.")
-	removeCmd.Flags().BoolP("exclusion", "e", true, "define if the instances should be remove with exclusion.")
-	removeCmd.Flags().BoolP("shrink", "s", false, "define if the removed instances should not be replaced.")
-	err := removeCmd.MarkFlagRequired("cluster")
-
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	err = removeCmd.MarkFlagRequired("instances")
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	rootCmd.AddCommand(removeCmd)
+	return cmd
 }

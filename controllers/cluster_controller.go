@@ -35,6 +35,8 @@ import (
 	"strings"
 	"time"
 
+	"golang.org/x/net/context"
+
 	fdbtypes "github.com/FoundationDB/fdb-kubernetes-operator/api/v1beta1"
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
@@ -50,14 +52,14 @@ import (
 )
 
 var instanceIDRegex = regexp.MustCompile(`^([\w-]+)-(\d+)`)
-var processIDRegex = regexp.MustCompile(`^(\w+-\d)-\d$`)
+var processIDRegex = regexp.MustCompile(`^([\w-]+-\d)-\d$`)
 
 // FoundationDBClusterReconciler reconciles a FoundationDBCluster object
 type FoundationDBClusterReconciler struct {
 	client.Client
 	Recorder            record.EventRecorder
 	Log                 logr.Logger
-	Scheme              *runtime.Scheme
+	scheme              *runtime.Scheme
 	InSimulation        bool
 	PodLifecycleManager PodLifecycleManager
 	PodClientProvider   func(*fdbtypes.FoundationDBCluster, *corev1.Pod) (FdbPodClient, error)
@@ -67,6 +69,17 @@ type FoundationDBClusterReconciler struct {
 	UseFutureDefaults   bool
 	Namespace           string
 	DeprecationOptions  DeprecationOptions
+	RequeueOnNotFound   bool
+}
+
+// SetScheme sets the current runtime Scheme
+func (r *FoundationDBClusterReconciler) SetScheme(scheme *runtime.Scheme) {
+	r.scheme = scheme
+}
+
+// Scheme returns the current runtime Scheme
+func (r *FoundationDBClusterReconciler) Scheme() *runtime.Scheme {
+	return r.scheme
 }
 
 // +kubebuilder:rbac:groups=apps.foundationdb.org,resources=foundationdbclusters,verbs=get;list;watch;create;update;patch;delete
@@ -74,21 +87,24 @@ type FoundationDBClusterReconciler struct {
 // +kubebuilder:rbac:groups="",resources=pods;configmaps;persistentvolumeclaims;events;secrets;services,verbs=get;list;watch;create;update;patch;delete
 
 // Reconcile runs the reconciliation logic.
-func (r *FoundationDBClusterReconciler) Reconcile(request ctrl.Request) (ctrl.Result, error) {
-	// your logic here
-
+func (r *FoundationDBClusterReconciler) Reconcile(ctx context.Context, request ctrl.Request) (ctrl.Result, error) {
 	cluster := &fdbtypes.FoundationDBCluster{}
-	context := ctx.Background()
 
-	err := r.Get(context, request.NamespacedName, cluster)
+	err := r.Get(ctx, request.NamespacedName, cluster)
 
 	originalGeneration := cluster.ObjectMeta.Generation
 
 	if err != nil {
 		if k8serrors.IsNotFound(err) {
-			// Object not found, return.  Created objects are automatically garbage collected.
+			// Object not found, return. Created objects are automatically garbage collected.
 			// For additional cleanup logic use finalizers.
+			cleanUpDBCache(request.Namespace, request.Name)
+
+			if r.RequeueOnNotFound {
+				return ctrl.Result{Requeue: true}, nil
+			}
 			return ctrl.Result{}, nil
+
 		}
 		// Error reading the object - requeue the request.
 		return ctrl.Result{}, err
@@ -117,10 +133,13 @@ func (r *FoundationDBClusterReconciler) Reconcile(request ctrl.Request) (ctrl.Re
 
 	subReconcilers := []ClusterSubReconciler{
 		UpdateStatus{},
+		UpdateLockConfiguration{},
 		CheckClientCompatibility{},
-		CheckInstancesToRemove{},
 		ReplaceMisconfiguredPods{},
+		ReplaceFailedPods{},
+		AddProcessGroups{},
 		AddServices{},
+		AddPVCs{},
 		AddPods{},
 		GenerateInitialClusterFile{},
 		UpdateSidecarVersions{},
@@ -135,14 +154,13 @@ func (r *FoundationDBClusterReconciler) Reconcile(request ctrl.Request) (ctrl.Re
 		UpdatePods{},
 		RemoveServices{},
 		RemovePods{},
-		IncludeInstances{},
 		UpdateStatus{},
 	}
 
 	for _, subReconciler := range subReconcilers {
 		cluster.Spec = *(normalizedSpec.DeepCopy())
 
-		canContinue, err := subReconciler.Reconcile(r, context, cluster)
+		canContinue, err := subReconciler.Reconcile(r, ctx, cluster)
 		if !canContinue || err != nil {
 			log.Info("Reconciliation terminated early", "namespace", cluster.Namespace, "name", cluster.Name, "lastAction", fmt.Sprintf("%T", subReconciler))
 		}
@@ -175,35 +193,38 @@ func (r *FoundationDBClusterReconciler) Reconcile(request ctrl.Request) (ctrl.Re
 }
 
 // SetupWithManager prepares a reconciler for use.
-func (r *FoundationDBClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	err := mgr.GetFieldIndexer().IndexField(&corev1.Pod{}, "metadata.name", func(o runtime.Object) []string {
+func (r *FoundationDBClusterReconciler) SetupWithManager(mgr ctrl.Manager, watchedObjects ...client.Object) error {
+	err := mgr.GetFieldIndexer().IndexField(ctx.Background(), &corev1.Pod{}, "metadata.name", func(o client.Object) []string {
 		return []string{o.(*corev1.Pod).Name}
 	})
 	if err != nil {
 		return err
 	}
 
-	err = mgr.GetFieldIndexer().IndexField(&corev1.Service{}, "metadata.name", func(o runtime.Object) []string {
+	err = mgr.GetFieldIndexer().IndexField(ctx.Background(), &corev1.Service{}, "metadata.name", func(o client.Object) []string {
 		return []string{o.(*corev1.Service).Name}
 	})
 	if err != nil {
 		return err
 	}
 
-	err = mgr.GetFieldIndexer().IndexField(&corev1.PersistentVolumeClaim{}, "metadata.name", func(o runtime.Object) []string {
+	err = mgr.GetFieldIndexer().IndexField(ctx.Background(), &corev1.PersistentVolumeClaim{}, "metadata.name", func(o client.Object) []string {
 		return []string{o.(*corev1.PersistentVolumeClaim).Name}
 	})
 	if err != nil {
 		return err
 	}
 
-	return ctrl.NewControllerManagedBy(mgr).
+	builder := ctrl.NewControllerManagedBy(mgr).
 		For(&fdbtypes.FoundationDBCluster{}).
 		Owns(&corev1.Pod{}).
 		Owns(&corev1.PersistentVolumeClaim{}).
 		Owns(&corev1.ConfigMap{}).
-		Owns(&corev1.Service{}).
-		Complete(r)
+		Owns(&corev1.Service{})
+	for _, object := range watchedObjects {
+		builder.Owns(object)
+	}
+	return builder.Complete(r)
 }
 
 func (r *FoundationDBClusterReconciler) checkRetryableError(err error) (ctrl.Result, error) {
@@ -271,7 +292,7 @@ func (r *FoundationDBClusterReconciler) updatePodDynamicConf(cluster *fdbtypes.F
 	return true, nil
 }
 
-func getPodMetadata(cluster *fdbtypes.FoundationDBCluster, processClass string, id string, specHash string) metav1.ObjectMeta {
+func getPodMetadata(cluster *fdbtypes.FoundationDBCluster, processClass fdbtypes.ProcessClass, id string, specHash string) metav1.ObjectMeta {
 	var customMetadata *metav1.ObjectMeta
 
 	processSettings := cluster.GetProcessSettings(processClass)
@@ -292,7 +313,7 @@ func getPodMetadata(cluster *fdbtypes.FoundationDBCluster, processClass string, 
 	return metadata
 }
 
-func getPvcMetadata(cluster *fdbtypes.FoundationDBCluster, processClass string, id string) metav1.ObjectMeta {
+func getPvcMetadata(cluster *fdbtypes.FoundationDBCluster, processClass fdbtypes.ProcessClass, id string) metav1.ObjectMeta {
 	var customMetadata *metav1.ObjectMeta
 
 	processSettings := cluster.GetProcessSettings(processClass)
@@ -321,7 +342,7 @@ func getConfigMapMetadata(cluster *fdbtypes.FoundationDBCluster) metav1.ObjectMe
 	return metadata
 }
 
-func getObjectMetadata(cluster *fdbtypes.FoundationDBCluster, base *metav1.ObjectMeta, processClass string, id string) metav1.ObjectMeta {
+func getObjectMetadata(cluster *fdbtypes.FoundationDBCluster, base *metav1.ObjectMeta, processClass fdbtypes.ProcessClass, id string) metav1.ObjectMeta {
 	var metadata *metav1.ObjectMeta
 
 	if base != nil {
@@ -341,17 +362,17 @@ func getObjectMetadata(cluster *fdbtypes.FoundationDBCluster, base *metav1.Objec
 	return *metadata
 }
 
-func getMinimalPodLabels(cluster *fdbtypes.FoundationDBCluster, processClass string, id string) map[string]string {
+func getMinimalPodLabels(cluster *fdbtypes.FoundationDBCluster, processClass fdbtypes.ProcessClass, id string) map[string]string {
 	labels := map[string]string{}
 
-	labels["fdb-cluster-name"] = cluster.ObjectMeta.Name
+	labels[FDBClusterLabel] = cluster.ObjectMeta.Name
 
 	if processClass != "" {
-		labels["fdb-process-class"] = processClass
+		labels[FDBProcessClassLabel] = string(processClass)
 	}
 
 	if id != "" {
-		labels["fdb-instance-id"] = id
+		labels[FDBInstanceIDLabel] = id
 	}
 
 	return labels
@@ -361,7 +382,7 @@ func getMinimalSinglePodLabels(cluster *fdbtypes.FoundationDBCluster, id string)
 	return getMinimalPodLabels(cluster, "", id)
 }
 
-func getPodListOptions(cluster *fdbtypes.FoundationDBCluster, processClass string, id string) []client.ListOption {
+func getPodListOptions(cluster *fdbtypes.FoundationDBCluster, processClass fdbtypes.ProcessClass, id string) []client.ListOption {
 	return []client.ListOption{client.InNamespace(cluster.ObjectMeta.Namespace), client.MatchingLabels(getMinimalPodLabels(cluster, processClass, id))}
 }
 
@@ -380,7 +401,7 @@ func buildOwnerReference(ownerType metav1.TypeMeta, ownerMetadata metav1.ObjectM
 	}}
 }
 
-func setMonitorConfForFilename(cluster *fdbtypes.FoundationDBCluster, data map[string]string, filename string, connectionString string, processClass string, serversPerPod int) error {
+func setMonitorConfForFilename(cluster *fdbtypes.FoundationDBCluster, data map[string]string, filename string, connectionString string, processClass fdbtypes.ProcessClass, serversPerPod int) error {
 	if connectionString == "" {
 		data[filename] = ""
 	} else {
@@ -505,14 +526,6 @@ func GetConfigMap(cluster *fdbtypes.FoundationDBCluster) (*corev1.ConfigMap, err
 		data["sidecar-conf"] = string(sidecarConfData)
 	}
 
-	if cluster.Status.PendingRemovals != nil {
-		pendingRemovalData, err := json.Marshal(cluster.Status.PendingRemovals)
-		if err != nil {
-			return nil, err
-		}
-		data["pending-removals"] = string(pendingRemovalData)
-	}
-
 	if cluster.Spec.ConfigMap != nil {
 		for k, v := range cluster.Spec.ConfigMap.Data {
 			data[k] = v
@@ -538,7 +551,7 @@ func GetConfigMapHash(cluster *fdbtypes.FoundationDBCluster) (string, error) {
 }
 
 // GetMonitorConf builds the monitor conf template
-func GetMonitorConf(cluster *fdbtypes.FoundationDBCluster, processClass string, podClient FdbPodClient, serversPerPod int) (string, error) {
+func GetMonitorConf(cluster *fdbtypes.FoundationDBCluster, processClass fdbtypes.ProcessClass, podClient FdbPodClient, serversPerPod int) (string, error) {
 	if cluster.Status.ConnectionString == "" {
 		return "", nil
 	}
@@ -590,7 +603,7 @@ func GetStartCommand(cluster *fdbtypes.FoundationDBCluster, instance FdbInstance
 	return command, nil
 }
 
-func getStartCommandLines(cluster *fdbtypes.FoundationDBCluster, processClass string, podClient FdbPodClient, processNumber int, processCount int) ([]string, error) {
+func getStartCommandLines(cluster *fdbtypes.FoundationDBCluster, processClass fdbtypes.ProcessClass, podClient FdbPodClient, processNumber int, processCount int) ([]string, error) {
 	confLines := make([]string, 0, 20)
 
 	var substitutions map[string]string
@@ -681,7 +694,7 @@ func getStartCommandLines(cluster *fdbtypes.FoundationDBCluster, processClass st
 }
 
 // GetPodSpecHash builds the hash of the expected spec for a pod.
-func GetPodSpecHash(cluster *fdbtypes.FoundationDBCluster, processClass string, id int, spec *corev1.PodSpec) (string, error) {
+func GetPodSpecHash(cluster *fdbtypes.FoundationDBCluster, processClass fdbtypes.ProcessClass, id int, spec *corev1.PodSpec) (string, error) {
 	var err error
 	if spec == nil {
 		spec, err = GetPodSpec(cluster, processClass, id)
@@ -713,9 +726,7 @@ func GetJSONHash(object interface{}) (string, error) {
 func GetDynamicConfHash(configMap *corev1.ConfigMap) (string, error) {
 	var data = make(map[string]string, len(configMap.Data))
 	for key, value := range configMap.Data {
-		if key != "pending-removals" {
-			data[key] = value
-		}
+		data[key] = value
 	}
 	return GetJSONHash(data)
 }
@@ -743,6 +754,7 @@ func (r *FoundationDBClusterReconciler) getLockClient(cluster *fdbtypes.Foundati
 
 // takeLock attempts to acquire a lock.
 func (r *FoundationDBClusterReconciler) takeLock(cluster *fdbtypes.FoundationDBCluster, action string) (bool, error) {
+	log.Info("Taking lock on cluster", "namespace", cluster.Namespace, "cluster", cluster.Name, "action", action)
 	lockClient, err := r.getLockClient(cluster)
 	if err != nil {
 		return false, err
@@ -759,25 +771,6 @@ func (r *FoundationDBClusterReconciler) takeLock(cluster *fdbtypes.FoundationDBC
 	return hasLock, nil
 }
 
-// getPendingRemovalState builds pending removal state for an instance we want
-// to remove.
-func (r *FoundationDBClusterReconciler) getPendingRemovalState(instance FdbInstance) fdbtypes.PendingRemovalState {
-	state := fdbtypes.PendingRemovalState{
-		PodName:     instance.Metadata.Name,
-		HadInstance: true,
-	}
-	if instance.Pod != nil {
-		if r.PodIPProvider != nil {
-			state.Address = r.PodIPProvider(instance.Pod)
-		} else if ip := instance.Pod.Annotations[PublicIPAnnotation]; ip != "" {
-			state.Address = ip
-		} else {
-			state.Address = instance.Pod.Status.PodIP
-		}
-	}
-	return state
-}
-
 // clearPendingRemovalsFromSpec removes the pending removals from the cluster
 // spec.
 func (r *FoundationDBClusterReconciler) clearPendingRemovalsFromSpec(context ctx.Context, cluster *fdbtypes.FoundationDBCluster) error {
@@ -789,44 +782,6 @@ func (r *FoundationDBClusterReconciler) clearPendingRemovalsFromSpec(context ctx
 	modifiedCluster.Spec.PendingRemovals = nil
 	err = r.Update(context, modifiedCluster)
 	return err
-}
-
-// updatePendingRemovals processes an update to the pending removals for the
-// cluster.
-//
-// This will update both the status and the config map.
-func (r *FoundationDBClusterReconciler) updatePendingRemovals(context ctx.Context, cluster *fdbtypes.FoundationDBCluster) error {
-	err := r.Status().Update(context, cluster)
-	if err != nil {
-		return err
-	}
-
-	metadata := getConfigMapMetadata(cluster)
-	configMap := &corev1.ConfigMap{}
-
-	err = r.Get(context, types.NamespacedName{Namespace: metadata.Namespace, Name: metadata.Name}, configMap)
-	if err != nil {
-		if !k8serrors.IsNotFound(err) {
-			return err
-		}
-	} else {
-		if cluster.Status.PendingRemovals == nil {
-			configMap.Data["pending-removals"] = ""
-		} else {
-			pendingRemovalData, err := json.Marshal(cluster.Status.PendingRemovals)
-			if err != nil {
-				return err
-			}
-			configMap.Data["pending-removals"] = string(pendingRemovalData)
-		}
-
-		err = r.Update(context, configMap)
-		if err != nil {
-			return err
-		}
-	}
-
-	return nil
 }
 
 func sortPodsByID(pods *corev1.PodList) {
@@ -919,17 +874,17 @@ func (instance FdbInstance) GetInstanceID() string {
 
 // GetInstanceIDFromMeta fetches the instance ID from an object's metadata.
 func GetInstanceIDFromMeta(metadata metav1.ObjectMeta) string {
-	return metadata.Labels["fdb-instance-id"]
+	return metadata.Labels[FDBInstanceIDLabel]
 }
 
 // GetProcessClass fetches the process class from an instance's metadata.
-func (instance FdbInstance) GetProcessClass() string {
+func (instance FdbInstance) GetProcessClass() fdbtypes.ProcessClass {
 	return GetProcessClassFromMeta(*instance.Metadata)
 }
 
 // GetProcessClassFromMeta fetches the process class from an object's metadata.
-func GetProcessClassFromMeta(metadata metav1.ObjectMeta) string {
-	return metadata.Labels["fdb-process-class"]
+func GetProcessClassFromMeta(metadata metav1.ObjectMeta) fdbtypes.ProcessClass {
+	return processClassFromLabels(metadata.Labels)
 }
 
 // GetPublicIPSource determines how an instance has gotten its public IP.
@@ -939,6 +894,21 @@ func (instance FdbInstance) GetPublicIPSource() fdbtypes.PublicIPSource {
 		return fdbtypes.PublicIPSourcePod
 	}
 	return fdbtypes.PublicIPSource(source)
+}
+
+// GetPublicIPs returns the public IP of an instance.
+func (instance FdbInstance) GetPublicIPs() []string {
+	if instance.Pod == nil {
+		return []string{}
+	}
+
+	source := instance.Metadata.Annotations[PublicIPSourceAnnotation]
+	if source == "" || source == string(fdbtypes.PublicIPSourcePod) {
+		// TODO for dual-stack support return PodIPs
+		return []string{instance.Pod.Status.PodIP}
+	}
+
+	return []string{instance.Pod.ObjectMeta.Annotations[PublicIPAnnotation]}
 }
 
 // GetProcessID fetches the instance ID from an instance's metadata.
@@ -1032,7 +1002,7 @@ func (manager StandardPodLifecycleManager) InstanceIsUpdated(*FoundationDBCluste
 }
 
 // ParseInstanceID extracts the components of an instance ID.
-func ParseInstanceID(id string) (string, int, error) {
+func ParseInstanceID(id string) (fdbtypes.ProcessClass, int, error) {
 	result := instanceIDRegex.FindStringSubmatch(id)
 	if result == nil {
 		return "", 0, fmt.Errorf("could not parse instance ID %s", id)
@@ -1042,7 +1012,7 @@ func ParseInstanceID(id string) (string, int, error) {
 	if err != nil {
 		return "", 0, err
 	}
-	return prefix, number, nil
+	return fdbtypes.ProcessClass(prefix), number, nil
 }
 
 // GetInstanceIDFromProcessID returns the instance ID for the process ID
@@ -1151,7 +1121,7 @@ func localityInfoFromSidecar(cluster *fdbtypes.FoundationDBCluster, client FdbPo
 		ID:      substitutions["FDB_INSTANCE_ID"],
 		Address: address,
 		LocalityData: map[string]string{
-			"zoneid": substitutions["FDB_ZONE_ID"],
+			FDBLocalityZoneIDKey: substitutions["FDB_ZONE_ID"],
 		},
 	}, nil
 }
@@ -1193,7 +1163,7 @@ func chooseDistributedProcesses(processes []localityInfo, count int, constraint 
 
 	fields := constraint.Fields
 	if len(fields) == 0 {
-		fields = []string{"zoneid", "dcid"}
+		fields = []string{FDBLocalityZoneIDKey, FDBLocalityDCIDKey}
 	}
 
 	chosenCounts := make(map[string]map[string]int, len(fields))
@@ -1287,21 +1257,22 @@ func checkCoordinatorValidity(cluster *fdbtypes.FoundationDBCluster, status *fdb
 	coordinatorZones := make(map[string]int, len(coordinatorStatus))
 	coordinatorDCs := make(map[string]int, len(coordinatorStatus))
 
-	removals := cluster.Status.PendingRemovals
-	if removals == nil {
-		removals = make(map[string]fdbtypes.PendingRemovalState)
+	processGroups := make(map[string]*fdbtypes.ProcessGroupStatus)
+	for _, processGroup := range cluster.Status.ProcessGroups {
+		processGroups[processGroup.ProcessGroupID] = processGroup
 	}
 
 	for _, process := range status.Cluster.Processes {
 		_, isCoordinator := coordinatorStatus[process.Address]
-		_, pendingRemoval := removals[process.Locality["instance_id"]]
+		processGroupStatus := processGroups[process.Locality["instance_id"]]
+		pendingRemoval := processGroupStatus != nil && processGroupStatus.Remove
 		if isCoordinator && !process.Excluded && !pendingRemoval {
 			coordinatorStatus[process.Address] = true
 		}
 
 		if isCoordinator {
-			coordinatorZones[process.Locality["zoneid"]]++
-			coordinatorDCs[process.Locality["dcid"]]++
+			coordinatorZones[process.Locality[FDBLocalityZoneIDKey]]++
+			coordinatorDCs[process.Locality[FDBLocalityDCIDKey]]++
 		}
 
 		if process.Address == "" {

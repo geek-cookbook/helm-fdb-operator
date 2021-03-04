@@ -4,6 +4,8 @@ This Document documents the types introduced by the FoundationDB Operator to be 
 > Note this document is generated from code comments. When contributing a change to this document please do so by changing the code comments.
 
 ## Table of Contents
+* [AutomaticReplacementOptions](#automaticreplacementoptions)
+* [BuggifyConfig](#buggifyconfig)
 * [ClusterGenerationStatus](#clustergenerationstatus)
 * [ClusterHealth](#clusterhealth)
 * [ConnectionString](#connectionstring)
@@ -32,16 +34,41 @@ This Document documents the types introduced by the FoundationDB Operator to be 
 * [FoundationDBStatusMovingData](#foundationdbstatusmovingdata)
 * [FoundationDBStatusProcessInfo](#foundationdbstatusprocessinfo)
 * [FoundationDBStatusSupportedVersion](#foundationdbstatussupportedversion)
+* [LockDenyListEntry](#lockdenylistentry)
 * [LockOptions](#lockoptions)
+* [LockSystemStatus](#locksystemstatus)
 * [PendingRemovalState](#pendingremovalstate)
 * [ProcessAddress](#processaddress)
 * [ProcessCounts](#processcounts)
+* [ProcessGroupCondition](#processgroupcondition)
+* [ProcessGroupStatus](#processgroupstatus)
 * [ProcessSettings](#processsettings)
 * [Region](#region)
 * [RequiredAddressSet](#requiredaddressset)
 * [RoleCounts](#rolecounts)
 * [ServiceConfig](#serviceconfig)
 * [VersionFlags](#versionflags)
+
+## AutomaticReplacementOptions
+
+AutomaticReplacementOptions controls options for automatically replacing failed processes.
+
+| Field | Description | Scheme | Required |
+| ----- | ----------- | ------ | -------- |
+| enabled | Enabled controls whether automatic replacements are enabled. The default is false. | *bool | false |
+| failureDetectionTimeSeconds | FailureDetectionTimeSeconds controls how long a process must be failed or missing before it is automatically replaced. The default is 1800 seconds, or 30 minutes. | *int | false |
+
+[Back to TOC](#table-of-contents)
+
+## BuggifyConfig
+
+BuggifyConfig provides options for injecting faults into a cluster for testing.
+
+| Field | Description | Scheme | Required |
+| ----- | ----------- | ------ | -------- |
+| noSchedule | NoSchedule defines a list of instance IDs that should fail to schedule. | []string | false |
+
+[Back to TOC](#table-of-contents)
 
 ## ClusterGenerationStatus
 
@@ -62,7 +89,9 @@ ClusterGenerationStatus stores information on which generations have reached dif
 | needsServiceUpdate | NeedsServiceUpdate provides the last generation that needs an update to the service config. | int64 | false |
 | needsBackupAgentUpdate | NeedsBackupAgentUpdate provides the last generation that could not complete reconciliation because the backup agent deployment needs to be updated. **Deprecated: This needs to get moved into FoundationDBBackup** | int64 | false |
 | hasPendingRemoval | HasPendingRemoval provides the last generation that has pods that have been excluded but are pending being removed.  A cluster in this state is considered reconciled, but we track this in the status to allow users of the operator to track when the removal is fully complete. | int64 | false |
-| hasFailingPods | HasFailingPods provides the last generation that has pods that are failing to start. | int64 | false |
+| hasFailingPods | HasFailingPods provides the last generation that has pods that are failing to start. **Deprecated: This is no longer used.** | int64 | false |
+| hasUnhealthyProcess | HasUnhealthyProcess provides the last generation that has at least one process group with a negative condition. | int64 | false |
+| needsLockConfigurationChanges | NeedsLockConfigurationChanges provides the last generation that is pending a change to the configuration of the locking system. | int64 | false |
 
 [Back to TOC](#table-of-contents)
 
@@ -166,6 +195,7 @@ FoundationDBClusterAutomationOptions provides flags for enabling or disabling op
 | configureDatabase | ConfigureDatabase defines whether the operator is allowed to reconfigure the database. | *bool | false |
 | killProcesses | KillProcesses defines whether the operator is allowed to bounce fdbserver processes. | *bool | false |
 | deletePods | DeletePods defines whether the operator is allowed to delete pods in order to recreate them. | *bool | false |
+| replacements | Replacements contains options for automatically replacing failed processes. | [AutomaticReplacementOptions](#automaticreplacementoptions) | false |
 
 [Back to TOC](#table-of-contents)
 
@@ -203,7 +233,7 @@ FoundationDBClusterSpec defines the desired state of a cluster.
 | version | Version defines the version of FoundationDB the cluster should run. | string | true |
 | sidecarVersions | SidecarVersions defines the build version of the sidecar to run. This maps an FDB version to the corresponding sidecar build version. | map[string]int | false |
 | databaseConfiguration | DatabaseConfiguration defines the database configuration. | [DatabaseConfiguration](#databaseconfiguration) | false |
-| processes | Processes defines process-level settings. | map[string][ProcessSettings](#processsettings) | false |
+| processes | Processes defines process-level settings. | map[ProcessClass][ProcessSettings](#processsettings) | false |
 | processCounts | ProcessCounts defines the number of processes to configure for each process class. You can generally omit this, to allow the operator to infer the process counts based on the database configuration. | [ProcessCounts](#processcounts) | false |
 | seedConnectionString | SeedConnectionString provides a connection string for the initial reconciliation.  After the initial reconciliation, this will not be used. | string | false |
 | faultDomain | FaultDomain defines the rules for what fault domain to replicate across. | [FoundationDBClusterFaultDomain](#foundationdbclusterfaultdomain) | false |
@@ -213,16 +243,17 @@ FoundationDBClusterSpec defines the desired state of a cluster.
 | mainContainer | MainContainer defines customization for the foundationdb container. | [ContainerOverrides](#containeroverrides) | false |
 | sidecarContainer | SidecarContainer defines customization for the foundationdb-kubernetes-sidecar container. | [ContainerOverrides](#containeroverrides) | false |
 | trustedCAs | TrustedCAs defines a list of root CAs the cluster should trust, in PEM format. | []string | false |
-| sidecarVariables | SidecarVariables defines Ccustom variables that the sidecar should make available for substitution in the monitor conf file. | []string | false |
+| sidecarVariables | SidecarVariables defines Custom variables that the sidecar should make available for substitution in the monitor conf file. | []string | false |
 | logGroup | LogGroup defines the log group to use for the trace logs for the cluster. | string | false |
 | dataCenter | DataCenter defines the data center where these processes are running. | string | false |
 | dataHall | DataHall defines the data hall where these processes are running. | string | false |
 | automationOptions | AutomationOptions defines customization for enabling or disabling certain operations in the operator. | [FoundationDBClusterAutomationOptions](#foundationdbclusterautomationoptions) | false |
-| instanceIDPrefix | InstanceIDPrefix defines a prefix to append to the instance IDs in the locality fields. | string | false |
+| instanceIDPrefix | InstanceIDPrefix defines a prefix to append to the instance IDs in the locality fields.  This must be a valid Kubernetes label value. See https://kubernetes.io/docs/concepts/overview/working-with-objects/labels/#syntax-and-character-set for more details on that. | string | false |
 | updatePodsByReplacement | UpdatePodsByReplacement determines whether we should update pod config by replacing the pods rather than deleting them. | bool | false |
 | lockOptions | LockOptions allows customizing how we manage locks for global operations. | [LockOptions](#lockoptions) | false |
 | services | Services defines the configuration for services that sit in front of our pods. | [ServiceConfig](#serviceconfig) | false |
 | ignoreUpgradabilityChecks | IgnoreUpgradabilityChecks determines whether we should skip the check for client compatibility when performing an upgrade. | bool | false |
+| buggify | Buggify defines settings for injecting faults into a cluster for testing. | [BuggifyConfig](#buggifyconfig) | false |
 | sidecarVersion | SidecarVersion defines the build version of the sidecar to use.  **Deprecated: Use SidecarVersions instead.** | int | false |
 | podLabels | PodLabels defines custom labels to apply to the FDB pods.  **Deprecated: Use the PodTemplate field instead.** | map[string]string | false |
 | resources | Resources defines the resource requirements for the foundationdb containers.  **Deprecated: Use the PodTemplate field instead.** | *[corev1.ResourceRequirements](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.17/#resourcerequirements-v1-core) | false |
@@ -251,11 +282,11 @@ FoundationDBClusterStatus defines the observed state of FoundationDBCluster
 
 | Field | Description | Scheme | Required |
 | ----- | ----------- | ------ | -------- |
-| processCounts | ProcessCounts defines the number of processes that are currently running in the cluster. | [ProcessCounts](#processcounts) | false |
-| incorrectProcesses | IncorrectProcesses provides the processes that do not have the correct configuration.  This will map the instance ID to the timestamp when we observed the incorrect configuration. | map[string]int64 | false |
-| incorrectPods | IncorrectPods provides the pods that do not have the correct spec.  This will contain the name of the pod. | []string | false |
-| failingPods | FailingPods provides the pods that are not starting correctly.  This will contain the name of the pod. | []string | false |
-| missingProcesses | MissingProcesses provides the processes that are not reporting to the cluster. This will map the names of the pod to the timestamp when we observed that the process was missing. | map[string]int64 | false |
+| processCounts | ProcessCounts defines the number of processes that are currently running in the cluster. **Deprecated: Use ProcessGroups instead.** | [ProcessCounts](#processcounts) | false |
+| incorrectProcesses | IncorrectProcesses provides the processes that do not have the correct configuration.  This will map the instance ID to the timestamp when we observed the incorrect configuration. **Deprecated: Use ProcessGroups instead.** | map[string]int64 | false |
+| incorrectPods | IncorrectPods provides the pods that do not have the correct spec.  This will contain the name of the pod. **Deprecated: Use ProcessGroups instead.** | []string | false |
+| failingPods | FailingPods provides the pods that are not starting correctly.  This will contain the name of the pod. **Deprecated: Use ProcessGroups instead.** | []string | false |
+| missingProcesses | MissingProcesses provides the processes that are not reporting to the cluster. This will map the names of the pod to the timestamp when we observed that the process was missing. **Deprecated: Use ProcessGroups instead.** | map[string]int64 | false |
 | databaseConfiguration | DatabaseConfiguration provides the running configuration of the database. | [DatabaseConfiguration](#databaseconfiguration) | false |
 | generations | Generations provides information about the latest generation to be reconciled, or to reach other stages at which reconciliation can halt. | [ClusterGenerationStatus](#clustergenerationstatus) | false |
 | health | Health provides information about the health of the database. | [ClusterHealth](#clusterhealth) | false |
@@ -266,9 +297,11 @@ FoundationDBClusterStatus defines the observed state of FoundationDBCluster
 | runningVersion | RunningVersion defines the version of FoundationDB that the cluster is currently running. | string | false |
 | connectionString | ConnectionString defines the contents of the cluster file. | string | false |
 | configured | Configured defines whether we have configured the database yet. | bool | false |
-| pendingRemovals | PendingRemovals defines the processes that are pending removal. This maps the instance ID to its removal state. | map[string][PendingRemovalState](#pendingremovalstate) | false |
+| pendingRemovals | PendingRemovals defines the processes that are pending removal. This maps the instance ID to its removal state. **Deprecated: Use ProcessGroups instead.** | map[string][PendingRemovalState](#pendingremovalstate) | false |
 | needsSidecarConfInConfigMap | NeedsSidecarConfInConfigMap determines whether we need to include the sidecar conf in the config map even when the latest version should not require it. | bool | false |
 | storageServersPerDisk | StorageServersPerDisk defines the storageServersPerPod observed in the cluster. If there are more than one value in the slice the reconcile phase is not finished. | []int | false |
+| processGroups | ProcessGroups contain information about a process group. This information is used in multiple places to trigger the according action. | []*[ProcessGroupStatus](#processgroupstatus) | false |
+| locks | Locks contains information about the locking system. | [LockSystemStatus](#locksystemstatus) | false |
 
 [Back to TOC](#table-of-contents)
 
@@ -427,7 +460,7 @@ FoundationDBStatusProcessInfo describes the \"processes\" portion of the cluster
 | Field | Description | Scheme | Required |
 | ----- | ----------- | ------ | -------- |
 | address | Address provides the address of the process. | string | false |
-| class_type | ProcessClass provides the process class the process has been given. | string | false |
+| class_type | ProcessClass provides the process class the process has been given. | ProcessClass | false |
 | command_line | CommandLine provides the command-line invocation for the process. | string | false |
 | excluded | Excluded indicates whether the process has been excluded. | bool | false |
 | locality | The locality information for the process. | map[string]string | false |
@@ -450,6 +483,17 @@ FoundationDBStatusSupportedVersion provides information about a version of FDB s
 
 [Back to TOC](#table-of-contents)
 
+## LockDenyListEntry
+
+LockDenyListEntry models an entry in the deny list for the locking system.
+
+| Field | Description | Scheme | Required |
+| ----- | ----------- | ------ | -------- |
+| id | The ID of the operator instance this entry is targeting. | string | false |
+| allow | Whether the instance is allowed to take locks. | bool | false |
+
+[Back to TOC](#table-of-contents)
+
 ## LockOptions
 
 LockOptions provides customization for locking global operations.
@@ -459,12 +503,23 @@ LockOptions provides customization for locking global operations.
 | disableLocks | DisableLocks determines whether we should disable locking entirely. | *bool | false |
 | lockKeyPrefix | LockKeyPrefix provides a custom prefix for the keys in the database we use to store locks. | string | false |
 | lockDurationMinutes | LockDurationMinutes determines the duration that locks should be valid for. | *int | false |
+| denyList | DenyList manages configuration for whether an instance of the operator should be denied from taking locks. | [][LockDenyListEntry](#lockdenylistentry) | false |
+
+[Back to TOC](#table-of-contents)
+
+## LockSystemStatus
+
+LockSystemStatus provides a summary of the status of the locking system.
+
+| Field | Description | Scheme | Required |
+| ----- | ----------- | ------ | -------- |
+| lockDenyList | DenyList contains a list of operator instances that are prevented from taking locks. | []string | false |
 
 [Back to TOC](#table-of-contents)
 
 ## PendingRemovalState
 
-PendingRemovalState holds information about a process that is being removed.
+PendingRemovalState holds information about a process that is being removed. **Deprecated: This is modeled in the process group status instead.**
 
 | Field | Description | Scheme | Required |
 | ----- | ----------- | ------ | -------- |
@@ -509,6 +564,33 @@ ProcessCounts represents the number of processes we have for each valid process 
 | data_distributor |  | int | false |
 | fast_restore |  | int | false |
 | backup |  | int | false |
+
+[Back to TOC](#table-of-contents)
+
+## ProcessGroupCondition
+
+ProcessGroupCondition represents a degraded condition that a process group is in.
+
+| Field | Description | Scheme | Required |
+| ----- | ----------- | ------ | -------- |
+| type | Name of the condition | ProcessGroupConditionType | false |
+| timestamp | Timestamp when the Condition was observed | int64 | false |
+
+[Back to TOC](#table-of-contents)
+
+## ProcessGroupStatus
+
+ProcessGroupStatus represents a the status of a ProcessGroup.
+
+| Field | Description | Scheme | Required |
+| ----- | ----------- | ------ | -------- |
+| processGroupID | ProcessGroupID represents the ID of the process group | string | false |
+| processClass | ProcessClass represents the class the process group has. | ProcessClass | false |
+| addresses | Addresses represents the list of addresses the process group has been known to have. | []string | false |
+| remove | Remove defines if the process group is marked for removal. | bool | false |
+| excluded | Excluded defines if the process group has been fully excluded. This is only used within the reconciliation process, and should not be considered authoritative. | bool | false |
+| exclusionSkipped | ExclusionSkipped determines if exclusion has been skipped for a process, which will allow the process group to be removed without exclusion. | bool | false |
+| processGroupConditions | ProcessGroupConditions represents a list of degraded conditions that the process group is in. | []*[ProcessGroupCondition](#processgroupcondition) | false |
 
 [Back to TOC](#table-of-contents)
 

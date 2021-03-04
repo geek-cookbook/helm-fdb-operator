@@ -22,64 +22,104 @@ package cmd
 
 import (
 	"fmt"
-	"log"
 	"strings"
 
+	fdbtypes "github.com/FoundationDB/fdb-kubernetes-operator/api/v1beta1"
+	"k8s.io/apimachinery/pkg/runtime"
+	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	"k8s.io/cli-runtime/pkg/genericclioptions"
+
 	"github.com/spf13/cobra"
-	"k8s.io/client-go/kubernetes"
 )
 
-var pluginVersion string = "v0.23.1"
+var pluginVersion = "latest"
 
-// versionCmd represents the version command
-var versionCmd = &cobra.Command{
-	Use:   "version",
-	Short: "version of kubectl-fdb & foundationdb-operator",
-	Long:  `version of kubectl-fdb and current running foundationdb-operator`,
-	Run: func(cmd *cobra.Command, args []string) {
-		namespace, err := rootCmd.Flags().GetString("namespace")
-		if err != nil {
-			log.Fatal(err)
-		}
-		kubeconfig, err := rootCmd.Flags().GetString("kubeconfig")
-		if err != nil {
-			log.Fatal(err)
-		}
-		operatorName, err := rootCmd.Flags().GetString("operator-name")
-		if err != nil {
-			log.Fatal(err)
-		}
+func newVersionCmd(streams genericclioptions.IOStreams, rootCmd *cobra.Command) *cobra.Command {
+	o := NewFDBOptions(streams)
 
-		config := getConfig(kubeconfig)
-		client, err := kubernetes.NewForConfig(config)
-		if err != nil {
-			log.Fatal(err)
-		}
+	cmd := &cobra.Command{
+		Use:   "version",
+		Short: "version of kubectl-fdb & foundationdb-operator",
+		Long:  `version of kubectl-fdb and current running foundationdb-operator`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			operatorName, err := rootCmd.Flags().GetString("operator-name")
+			if err != nil {
+				return err
+			}
+			clientOnly, err := cmd.Flags().GetBool("client-only")
+			if err != nil {
+				return nil
+			}
+			containerName, err := cmd.Flags().GetString("container-name")
+			if err != nil {
+				return nil
+			}
 
-		operatorVersion := version(client, operatorName, namespace)
+			config, err := o.configFlags.ToRESTConfig()
+			if err != nil {
+				return err
+			}
 
-		fmt.Printf("kubectl-fdb: %s\n", pluginVersion)
-		fmt.Printf("foundationdb-operator: %s\n", operatorVersion)
-	},
-	Example: `
+			scheme := runtime.NewScheme()
+			_ = clientgoscheme.AddToScheme(scheme)
+			_ = fdbtypes.AddToScheme(scheme)
+
+			kubeClient, err := client.New(config, client.Options{Scheme: scheme})
+			if err != nil {
+				return err
+			}
+
+			namespace, err := getNamespace(*o.configFlags.Namespace)
+			if err != nil {
+				return err
+			}
+
+			if !clientOnly {
+				operatorVersion, err := version(kubeClient, operatorName, namespace, containerName)
+				if err != nil {
+					return err
+				}
+				cmd.Printf("foundationdb-operator: %s\n", operatorVersion)
+			}
+
+			cmd.Printf("kubectl-fdb: %s\n", pluginVersion)
+
+			return nil
+		},
+		Example: `
 #Lists the version of kubectl fdb plugin and foundationdb operator in current namespace
 kubectl fdb version
 #Lists the version of kubectl fdb plugin and foundationdb operator in provided namespace
 kubectl fdb -n default version
 `,
-}
-
-func version(client kubernetes.Interface, operatorName string, namespace string) string {
-	operatorDeployment := getOperator(client, operatorName, namespace)
-	if operatorDeployment.Name == "" {
-		log.Fatalf("could not find the foundationdb-operator in the namespace: %s", namespace)
 	}
-	operatorImage := operatorDeployment.Spec.Template.Spec.Containers[0].Image
-	imageName := strings.Split(operatorImage, ":")
+	cmd.SetOut(o.Out)
+	cmd.SetErr(o.ErrOut)
+	cmd.SetIn(o.In)
 
-	return imageName[len(imageName)-1]
+	o.configFlags.AddFlags(cmd.Flags())
+	cmd.Flags().Bool("client-only", false, "Prints out the plugin version only without checking the operator version.")
+	cmd.Flags().String("container-name", "manager", "The container name of Kubernetes Deployment.")
+
+	return cmd
 }
 
-func init() {
-	rootCmd.AddCommand(versionCmd)
+func version(kubeClient client.Client, operatorName string, namespace string, containerName string) (string, error) {
+	operatorDeployment, err := getOperator(kubeClient, operatorName, namespace)
+	if err != nil {
+		return "", err
+	}
+
+	for _, container := range operatorDeployment.Spec.Template.Spec.Containers {
+		if container.Name != containerName {
+			continue
+		}
+
+		imageName := strings.Split(container.Image, ":")
+		return imageName[len(imageName)-1], nil
+	}
+
+	return "", fmt.Errorf("could not find container: %s in %s/%s", containerName, namespace, operatorName)
 }

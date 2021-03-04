@@ -8,7 +8,9 @@ on:
     paths:
       - 'charts/**' 
       - '.github/**'     
-      
+env:
+  KUBE_SCORE_VERSION: 1.10.0
+
 jobs:
   lint-chart:
     runs-on: ubuntu-latest
@@ -23,13 +25,9 @@ jobs:
         with:
           version: v3.4.0
 
-      - uses: actions/setup-python@v2
-        with:
-          python-version: 3.7
-
       - name: Set up kube-score
         run: |
-          wget https://github.com/zegl/kube-score/releases/download/v1.10.0/kube-score_1.10.0_linux_amd64 -O kube-score
+          wget https://github.com/zegl/kube-score/releases/download/v${{ env.KUBE_SCORE_VERSION }}/kube-score_${{ env.KUBE_SCORE_VERSION }}_linux_amd64 -O kube-score
           chmod 755 kube-score
 
       - name: Kube-score generated manifests
@@ -37,6 +35,14 @@ jobs:
               --ignore-test pod-networkpolicy
               --ignore-test deployment-has-poddisruptionbudget
               --ignore-test deployment-has-host-podantiaffinity
+              --ignore-test container-security-context              
+              --enable-optional-test container-security-context-privileged
+              --enable-optional-test container-security-context-readonlyrootfilesystem              
+
+      # python is a requirement for the chart-testing action below (supports yamllint among other tests)
+      - uses: actions/setup-python@v2
+        with:
+          python-version: 3.7
 
       - name: Set up chart-testing
         uses: helm/chart-testing-action@v2.0.1
@@ -84,3 +90,4 @@ jobs:
         uses: helm/chart-releaser-action@v1.1.0
         env:
           CR_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
+
