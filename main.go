@@ -24,7 +24,6 @@ import (
 	"github.com/FoundationDB/fdb-kubernetes-operator/fdbclient"
 	"github.com/FoundationDB/fdb-kubernetes-operator/setup"
 	"github.com/apple/foundationdb/bindings/go/src/fdb"
-	uzap "go.uber.org/zap"
 	"k8s.io/apimachinery/pkg/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	_ "k8s.io/client-go/plugin/pkg/client/auth/gcp"
