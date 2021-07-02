@@ -62,6 +62,9 @@ spec:
         resources:
           {{- toYaml $.Values.initContainersResources | nindent 10 }}
       {{- end }}
+        securityContext:
+          {{- toYaml .Values.initContainerSecurityContext | nindent 10 }}      
+      {{- end }}
       containers:
       - name: manager
         image: {{ .Values.image.repository }}:{{ .Values.image.tag }}
