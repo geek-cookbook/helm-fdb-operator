@@ -21,7 +21,6 @@
 
 import argparse
 import hashlib
-import http.server
 import logging
 import json
 import os
@@ -32,7 +31,10 @@ import stat
 import time
 import traceback
 import sys
+import tempfile
 from pathlib import Path
+
+from http.server import HTTPServer, ThreadingHTTPServer, BaseHTTPRequestHandler
 
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
@@ -58,7 +60,7 @@ class Config(object):
         )
         parser.add_argument(
             "--tls",
-            help=("This flag enables TLS for incoming " "connections"),
+            help=("This flag enables TLS for incoming connections"),
             action="store_true",
         )
         parser.add_argument(
@@ -103,7 +105,7 @@ class Config(object):
         )
         parser.add_argument(
             "--input-dir",
-            help=("The directory containing the input files " "the config map."),
+            help=("The directory containing the input files the config map."),
             default="/var/input-files",
         )
         parser.add_argument(
@@ -125,28 +127,26 @@ class Config(object):
         )
         parser.add_argument(
             "--copy-file",
-            help=("A file to copy from the config map to the " "output directory."),
+            help=("A file to copy from the config map to the output directory."),
             action="append",
         )
         parser.add_argument(
             "--copy-binary",
-            help=("A binary to copy from the to the output" "directory."),
+            help=("A binary to copy from the to the output directory."),
             action="append",
         )
         parser.add_argument(
             "--copy-library",
-            help=(
-                "A version of the client library to copy " "to the output directory."
-            ),
+            help=("A version of the client library to copy to the output directory."),
             action="append",
         )
         parser.add_argument(
             "--input-monitor-conf",
-            help=("The name of a monitor conf template in the " "input files"),
+            help=("The name of a monitor conf template in the input files"),
         )
         parser.add_argument(
             "--main-container-version",
-            help=("The version of the main foundationdb " "container in the pod"),
+            help=("The version of the main foundationdb container in the pod"),
         )
         parser.add_argument(
             "--main-container-conf-dir",
@@ -225,13 +225,12 @@ class Config(object):
         if self.substitutions["FDB_ZONE_ID"] == "":
             self.substitutions["FDB_ZONE_ID"] = self.substitutions["FDB_MACHINE_ID"]
         if self.substitutions["FDB_PUBLIC_IP"] == "":
-            address_info = socket.getaddrinfo(
-                self.substitutions["FDB_MACHINE_ID"],
-                4500,
-                family=socket.AddressFamily.AF_INET,
-            )
-            if len(address_info) > 0:
-                self.substitutions["FDB_PUBLIC_IP"] = address_info[0][4][0]
+            # As long as the public IP is not set fallback to the
+            # Pod IP address.
+            pod_ip = os.getenv("FDB_POD_IP")
+            if pod_ip is none:
+                pod_ip = socket.gethostbyname(socket.gethostname())
+            self.substitutions["FDB_PUBLIC_IP"] = pod_ip
 
         if self.main_container_version == self.primary_version:
             self.substitutions["BINARY_DIR"] = "/usr/bin"
@@ -306,7 +305,7 @@ class Config(object):
         )
 
 
-class Server(http.server.BaseHTTPRequestHandler):
+class Server(BaseHTTPRequestHandler):
     ssl_context = None
 
     @classmethod
@@ -316,12 +315,12 @@ class Server(http.server.BaseHTTPRequestHandler):
         """
         config = Config.shared()
         (address, port) = config.bind_address.split(":")
-        log.info("Listening on %s:%s" % (address, port))
-        httpd = http.server.HTTPServer((address, int(port)), cls)
+        log.info(f"Listening on {address}:{port}")
+        server = ThreadingHTTPServer((address, int(port)), cls)
 
         if config.enable_tls:
             context = Server.load_ssl_context()
-            httpd.socket = context.wrap_socket(httpd.socket, server_side=True)
+            server.socket = context.wrap_socket(server.socket, server_side=True)
             observer = Observer()
             event_handler = CertificateEventHandler()
             for path in set(
@@ -333,7 +332,7 @@ class Server(http.server.BaseHTTPRequestHandler):
                 observer.schedule(event_handler, path)
             observer.start()
 
-        httpd.serve_forever()
+        server.serve_forever()
 
     @classmethod
     def load_ssl_context(cls):
@@ -341,7 +340,7 @@ class Server(http.server.BaseHTTPRequestHandler):
         if not cls.ssl_context:
             cls.ssl_context = ssl.create_default_context(cafile=config.ca_file)
             cls.ssl_context.check_hostname = False
-            cls.ssl_context.verify_mode = ssl.CERT_REQUIRED
+            cls.ssl_context.verify_mode = ssl.CERT_OPTIONAL
         cls.ssl_context.load_cert_chain(config.certificate_file, config.key_file)
         return cls.ssl_context
 
@@ -359,13 +358,21 @@ class Server(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(response)
 
-    def check_request_cert(self):
+    def check_request_cert(self, path):
         config = Config.shared()
-        approved = not config.enable_tls or self.check_cert(
+
+        if path == "/ready":
+            return True
+
+        if not config.enable_tls:
+            return True
+
+        approved = self.check_cert(
             self.connection.getpeercert(), config.peer_verification_rules
         )
         if not approved:
             self.send_error(401, "Client certificate was not approved")
+
         return approved
 
     def check_cert(self, cert, rules):
@@ -375,6 +382,9 @@ class Server(http.server.BaseHTTPRequestHandler):
         If there is any problem with the certificate, this will return a string
         describing the error.
         """
+        if cert is None:
+            return False
+
         if not rules:
             return True
 
@@ -456,7 +466,7 @@ class Server(http.server.BaseHTTPRequestHandler):
         This method executes a GET request.
         """
         try:
-            if not self.check_request_cert():
+            if not self.check_request_cert(self.path):
                 return
             if self.path.startswith("/check_hash/"):
                 try:
@@ -483,7 +493,7 @@ class Server(http.server.BaseHTTPRequestHandler):
         This method executes a POST request.
         """
         try:
-            if not self.check_request_cert():
+            if not self.check_request_cert(self.path):
                 return
             if self.path == "/copy_files":
                 self.send_text(copy_files())
@@ -516,7 +526,19 @@ class Server(http.server.BaseHTTPRequestHandler):
 
 class CertificateEventHandler(FileSystemEventHandler):
     def on_any_event(self, event):
-        log.info("Detected change to certificates")
+        if event.is_directory:
+            return None
+
+        if event.event_type not in ["created", "modified"]:
+            return None
+
+        # We ignore all old files
+        if event.src_path.endswith(".old"):
+            return None
+
+        log.info(
+            f"Detected change to certificates path: {event.src_path}, type: {event.event_type }"
+        )
         time.sleep(10)
         log.info("Reloading certificates")
         Server.load_ssl_context()
@@ -536,10 +558,13 @@ def copy_files():
             path = os.path.join(config.input_dir, filename)
             if not os.path.isfile(path) or os.path.getsize(path) == 0:
                 raise Exception("No contents for file %s" % path)
+
     for filename in config.copy_files:
-        tmp_file = os.path.join(config.output_dir, f"{filename}.tmp")
-        shutil.copy(os.path.join(config.input_dir, filename), tmp_file)
-        os.replace(tmp_file, os.path.join(config.output_dir, filename))
+        tmp_file = tempfile.NamedTemporaryFile(
+            mode="w+b", dir=config.output_dir, delete=False
+        )
+        shutil.copy(os.path.join(config.input_dir, filename), tmp_file.name)
+        os.replace(tmp_file.name, os.path.join(config.output_dir, filename))
 
     return "OK"
 
@@ -554,9 +579,13 @@ def copy_binaries():
             )
             if not target_path.exists():
                 target_path.parent.mkdir(parents=True, exist_ok=True)
-                tmp_file = f"{target_path}.tmp"
-                shutil.copy(path, tmp_file)
-                os.replace(tmp_file, target_path)
+                tmp_file = tempfile.NamedTemporaryFile(
+                    mode="w+b",
+                    dir=target_path.parent,
+                    delete=False,
+                )
+                shutil.copy(path, tmp_file.name)
+                os.replace(tmp_file.name, target_path)
                 target_path.chmod(0o744)
     return "OK"
 
@@ -573,9 +602,11 @@ def copy_libraries():
             )
         if not target_path.exists():
             target_path.parent.mkdir(parents=True, exist_ok=True)
-            tmp_file = f"{target_path}.tmp"
-            shutil.copy(path, tmp_file)
-            os.replace(tmp_file, target_path)
+            tmp_file = tempfile.NamedTemporaryFile(
+                mode="w+b", dir=target_path.parent, delete=False
+            )
+            shutil.copy(path, tmp_file.name)
+            os.replace(tmp_file.name, target_path)
     return "OK"
 
 
@@ -591,13 +622,16 @@ def copy_monitor_conf():
                 "$" + variable, config.substitutions[variable]
             )
 
-        tmp_file = os.path.join(config.output_dir, "fdbmonitor.conf.tmp")
+        tmp_file = tempfile.NamedTemporaryFile(
+            mode="w+b", dir=config.output_dir, delete=False
+        )
         target_file = os.path.join(config.output_dir, "fdbmonitor.conf")
 
-        with open(tmp_file, "w") as output_conf_file:
+        with open(tmp_file.name, "w") as output_conf_file:
             output_conf_file.write(monitor_conf)
 
-        os.replace(tmp_file, target_file)
+        os.replace(tmp_file.name, target_file)
+
     return "OK"
 
 
@@ -629,5 +663,7 @@ if __name__ == "__main__":
     copy_libraries()
     copy_monitor_conf()
 
-    if not Config.shared().init_mode:
-        Server.start()
+    if Config.shared().init_mode:
+        sys.exit(0)
+
+    Server.start()

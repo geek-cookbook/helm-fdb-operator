@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2019 Apple Inc. and the FoundationDB project authors
+ * Copyright 2019-2021 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -23,7 +23,12 @@ package controllers
 import (
 	ctx "context"
 	"fmt"
-	"time"
+
+	"github.com/FoundationDB/fdb-kubernetes-operator/internal"
+
+	"k8s.io/apimachinery/pkg/api/resource"
+
+	"k8s.io/apimachinery/pkg/api/equality"
 
 	"k8s.io/apimachinery/pkg/api/equality"
 
@@ -36,7 +41,7 @@ import (
 type ReplaceMisconfiguredPods struct{}
 
 // Reconcile runs the reconciler's work.
-func (c ReplaceMisconfiguredPods) Reconcile(r *FoundationDBClusterReconciler, context ctx.Context, cluster *fdbtypes.FoundationDBCluster) (bool, error) {
+func (c ReplaceMisconfiguredPods) Reconcile(r *FoundationDBClusterReconciler, context ctx.Context, cluster *fdbtypes.FoundationDBCluster) *Requeue {
 	hasNewRemovals := false
 
 	processGroups := make(map[string]*fdbtypes.ProcessGroupStatus)
@@ -47,7 +52,7 @@ func (c ReplaceMisconfiguredPods) Reconcile(r *FoundationDBClusterReconciler, co
 	pvcs := &corev1.PersistentVolumeClaimList{}
 	err := r.List(context, pvcs, getPodListOptions(cluster, "", "")...)
 	if err != nil {
-		return false, err
+		return &Requeue{Error: err}
 	}
 
 	for _, pvc := range pvcs.Items {
@@ -66,49 +71,59 @@ func (c ReplaceMisconfiguredPods) Reconcile(r *FoundationDBClusterReconciler, co
 		instanceID := GetInstanceIDFromMeta(pvc.ObjectMeta)
 		processGroupStatus := processGroups[instanceID]
 		if processGroupStatus == nil {
-			return false, fmt.Errorf("unknown PVC %s in replace_misconfigured_pods", instanceID)
+			return &Requeue{Error: fmt.Errorf("unknown PVC %s in replace_misconfigured_pods", instanceID)}
 		}
+
 		if processGroupStatus.Remove {
 			continue
 		}
 
 		_, idNum, err := ParseInstanceID(instanceID)
 		if err != nil {
-			return false, err
+			return &Requeue{Error: err}
 		}
 
-		processClass := GetProcessClassFromMeta(pvc.ObjectMeta)
+		processClass := internal.GetProcessClassFromMeta(pvc.ObjectMeta)
 		desiredPVC, err := GetPvc(cluster, processClass, idNum)
 		if err != nil {
-			return false, err
-		}
-		pvcHash, err := GetJSONHash(desiredPVC.Spec)
-		if err != nil {
-			return false, err
+			return &Requeue{Error: err}
 		}
 
-		if pvc.Annotations[LastSpecKey] != pvcHash {
+		pvcHash, err := GetJSONHash(desiredPVC.Spec)
+		if err != nil {
+			return &Requeue{Error: err}
+		}
+
+		if pvc.Annotations[fdbtypes.LastSpecKey] != pvcHash {
 			instances, err := r.PodLifecycleManager.GetInstances(r, cluster, context, getSinglePodListOptions(cluster, instanceID)...)
 			if err != nil {
-				return false, err
+				return &Requeue{Error: err}
 			}
+
 			if len(instances) > 0 {
 				processGroupStatus.Remove = true
 				hasNewRemovals = true
+
+				log.Info("Replace instance",
+					"namespace", cluster.Namespace,
+					"name", cluster.Name,
+					"processGroupID", instanceID,
+					"pvc", pvc.Name,
+					"reason", fmt.Sprintf("PVC spec has changed from %s to %s", pvcHash, pvc.Annotations[fdbtypes.LastSpecKey]))
 			}
 		}
 	}
 
 	instances, err := r.PodLifecycleManager.GetInstances(r, cluster, context, getPodListOptions(cluster, "", "")...)
 	if err != nil {
-		return false, err
+		return &Requeue{Error: err}
 	}
 
 	for _, instance := range instances {
 		processGroupStatus := processGroups[instance.GetInstanceID()]
 		needsRemoval, err := instanceNeedsRemoval(cluster, instance, processGroupStatus)
 		if err != nil {
-			return false, err
+			return &Requeue{Error: err}
 		}
 
 		if needsRemoval {
@@ -120,13 +135,13 @@ func (c ReplaceMisconfiguredPods) Reconcile(r *FoundationDBClusterReconciler, co
 	if hasNewRemovals {
 		err = r.Status().Update(context, cluster)
 		if err != nil {
-			return false, err
+			return &Requeue{Error: err}
 		}
 
-		return false, nil
+		return &Requeue{Message: "Removals have been updated in the cluster status"}
 	}
 
-	return true, nil
+	return nil
 }
 
 func instanceNeedsRemoval(cluster *fdbtypes.FoundationDBCluster, instance FdbInstance, processGroupStatus *fdbtypes.ProcessGroupStatus) (bool, error) {
@@ -151,10 +166,20 @@ func instanceNeedsRemoval(cluster *fdbtypes.FoundationDBCluster, instance FdbIns
 
 	_, desiredInstanceID := getInstanceID(cluster, instance.GetProcessClass(), idNum)
 	if instanceID != desiredInstanceID {
+		log.Info("Replace instance",
+			"namespace", cluster.Namespace,
+			"name", cluster.Name,
+			"processGroupID", instanceID,
+			"reason", fmt.Sprintf("expect instanceID: %s", desiredInstanceID))
 		return true, nil
 	}
 
 	if instance.GetPublicIPSource() != cluster.GetPublicIPSource() {
+		log.Info("Replace instance",
+			"namespace", cluster.Namespace,
+			"name", cluster.Name,
+			"processGroupID", instanceID,
+			"reason", fmt.Sprintf("publicIP source has changed from %s to %s", instance.GetPublicIPSource(), cluster.GetPublicIPSource()))
 		return true, nil
 	}
 
@@ -166,12 +191,22 @@ func instanceNeedsRemoval(cluster *fdbtypes.FoundationDBCluster, instance FdbIns
 		}
 
 		if storageServersPerPod != cluster.GetStorageServersPerPod() {
+			log.Info("Replace instance",
+				"namespace", cluster.Namespace,
+				"name", cluster.Name,
+				"processGroupID", instanceID,
+				"reason", fmt.Sprintf("storageServersPerPod has changed from %d to %d", storageServersPerPod, cluster.GetStorageServersPerPod()))
 			return true, nil
 		}
 	}
 
 	expectedNodeSelector := cluster.GetProcessSettings(instance.GetProcessClass()).PodTemplate.Spec.NodeSelector
 	if !equality.Semantic.DeepEqual(instance.Pod.Spec.NodeSelector, expectedNodeSelector) {
+		log.Info("Replace instance",
+			"namespace", cluster.Namespace,
+			"name", cluster.Name,
+			"processGroupID", instanceID,
+			"reason", fmt.Sprintf("nodeSelector has changed from %s to %s", instance.Pod.Spec.NodeSelector, expectedNodeSelector))
 		return true, nil
 	}
 
@@ -181,14 +216,69 @@ func instanceNeedsRemoval(cluster *fdbtypes.FoundationDBCluster, instance FdbIns
 			return false, err
 		}
 
-		return instance.Metadata.Annotations[LastSpecKey] != specHash, nil
+		if instance.Metadata.Annotations[fdbtypes.LastSpecKey] != specHash {
+			log.Info("Replace instance",
+				"namespace", cluster.Namespace,
+				"name", cluster.Name,
+				"processGroupID", instanceID,
+				"reason", fmt.Sprintf("specHash has changed from %s to %s", specHash, instance.Metadata.Annotations[fdbtypes.LastSpecKey]))
+			return true, nil
+		}
+	}
+
+	if cluster.Spec.ReplaceInstancesWhenResourcesChange != nil && *cluster.Spec.ReplaceInstancesWhenResourcesChange {
+		desiredSpec, err := GetPodSpec(cluster, instance.GetProcessClass(), idNum)
+		if err != nil {
+			return false, err
+		}
+
+		if resourcesNeedsReplacement(desiredSpec.Containers, instance.Pod.Spec.Containers) {
+			log.Info("Replace instance",
+				"namespace", cluster.Namespace,
+				"name", cluster.Name,
+				"processGroupID", instanceID,
+				"reason", "Resource requests have changed")
+			return true, nil
+		}
+
+		if resourcesNeedsReplacement(desiredSpec.InitContainers, instance.Pod.Spec.InitContainers) {
+			log.Info("Replace instance",
+				"namespace", cluster.Namespace,
+				"name", cluster.Name,
+				"processGroupID", instanceID,
+				"reason", "Resource requests have changed")
+			return true, nil
+		}
 	}
 
 	return false, nil
 }
 
-// RequeueAfter returns the delay before we should run the reconciliation
-// again.
-func (c ReplaceMisconfiguredPods) RequeueAfter() time.Duration {
-	return 0
+func resourcesNeedsReplacement(desired []corev1.Container, current []corev1.Container) bool {
+	// We only care about requests since limits are ignored during scheduling
+	desiredCPURequests, desiredMemoryRequests := getCPUandMemoryRequests(desired)
+	currentCPURequests, currentMemoryRequests := getCPUandMemoryRequests(current)
+
+	return desiredCPURequests.Cmp(*currentCPURequests) == 1 || desiredMemoryRequests.Cmp(*currentMemoryRequests) == 1
+}
+
+func getCPUandMemoryRequests(containers []corev1.Container) (*resource.Quantity, *resource.Quantity) {
+	cpuRequests := &resource.Quantity{}
+	memoryRequests := &resource.Quantity{}
+
+	for _, container := range containers {
+		cpu := container.Resources.Requests.Cpu()
+
+		if cpu != nil {
+			cpuRequests.Add(*cpu)
+		}
+
+		memory := container.Resources.Requests.Memory()
+
+		if memory != nil {
+			memoryRequests.Add(*memory)
+		}
+	}
+
+	return cpuRequests, memoryRequests
 }

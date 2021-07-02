@@ -28,7 +28,6 @@ import (
 
 	"k8s.io/cli-runtime/pkg/genericclioptions"
 
-	"github.com/FoundationDB/fdb-kubernetes-operator/controllers"
 	corev1 "k8s.io/api/core/v1"
 
 	"github.com/spf13/cobra"
@@ -41,7 +40,7 @@ import (
 	fdbtypes "github.com/FoundationDB/fdb-kubernetes-operator/api/v1beta1"
 )
 
-func newCordonCmd(streams genericclioptions.IOStreams, rootCmd *cobra.Command) *cobra.Command {
+func newCordonCmd(streams genericclioptions.IOStreams) *cobra.Command {
 	o := NewFDBOptions(streams)
 	var nodeSelectors map[string]string
 
@@ -50,7 +49,7 @@ func newCordonCmd(streams genericclioptions.IOStreams, rootCmd *cobra.Command) *
 		Short: "Adds all instance (or multiple) that run on a node to the remove list of the given cluster",
 		Long:  "Adds all instance (or multiple) that run on a node to the remove list of the given cluster",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			force, err := rootCmd.Flags().GetBool("force")
+			force, err := cmd.Root().Flags().GetBool("force")
 			if err != nil {
 				return err
 			}
@@ -142,7 +141,7 @@ func cordonNode(kubeClient client.Client, clusterName string, nodes []string, na
 		err := kubeClient.List(ctx.Background(), &pods,
 			client.InNamespace(namespace),
 			client.MatchingLabels(map[string]string{
-				controllers.FDBClusterLabel: clusterName,
+				fdbtypes.FDBClusterLabel: clusterName,
 			}),
 			client.MatchingFieldsSelector{
 				Selector: fields.OneTermEqualSelector("spec.nodeName", node),
@@ -160,7 +159,7 @@ func cordonNode(kubeClient client.Client, clusterName string, nodes []string, na
 				continue
 			}
 
-			instanceID, ok := pod.Labels[controllers.FDBInstanceIDLabel]
+			instanceID, ok := pod.Labels[fdbtypes.FDBInstanceIDLabel]
 			if !ok {
 				fmt.Printf("could not fetch instance ID from Pod: %s\n", pod.Name)
 				continue
@@ -169,5 +168,5 @@ func cordonNode(kubeClient client.Client, clusterName string, nodes []string, na
 		}
 	}
 
-	return removeInstances(kubeClient, clusterName, instances, namespace, withExclusion, false, force)
+	return removeInstances(kubeClient, clusterName, instances, namespace, withExclusion, false, force, false)
 }

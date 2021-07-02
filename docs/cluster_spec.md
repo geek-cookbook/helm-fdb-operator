@@ -12,28 +12,12 @@ This Document documents the types introduced by the FoundationDB Operator to be 
 * [ContainerOverrides](#containeroverrides)
 * [DataCenter](#datacenter)
 * [DatabaseConfiguration](#databaseconfiguration)
-* [FdbVersion](#fdbversion)
 * [FoundationDBCluster](#foundationdbcluster)
 * [FoundationDBClusterAutomationOptions](#foundationdbclusterautomationoptions)
 * [FoundationDBClusterFaultDomain](#foundationdbclusterfaultdomain)
 * [FoundationDBClusterList](#foundationdbclusterlist)
 * [FoundationDBClusterSpec](#foundationdbclusterspec)
 * [FoundationDBClusterStatus](#foundationdbclusterstatus)
-* [FoundationDBStatus](#foundationdbstatus)
-* [FoundationDBStatusBackupInfo](#foundationdbstatusbackupinfo)
-* [FoundationDBStatusBackupTag](#foundationdbstatusbackuptag)
-* [FoundationDBStatusClientDBStatus](#foundationdbstatusclientdbstatus)
-* [FoundationDBStatusClusterClientInfo](#foundationdbstatusclusterclientinfo)
-* [FoundationDBStatusClusterInfo](#foundationdbstatusclusterinfo)
-* [FoundationDBStatusConnectedClient](#foundationdbstatusconnectedclient)
-* [FoundationDBStatusCoordinator](#foundationdbstatuscoordinator)
-* [FoundationDBStatusCoordinatorInfo](#foundationdbstatuscoordinatorinfo)
-* [FoundationDBStatusDataStatistics](#foundationdbstatusdatastatistics)
-* [FoundationDBStatusLayerInfo](#foundationdbstatuslayerinfo)
-* [FoundationDBStatusLocalClientInfo](#foundationdbstatuslocalclientinfo)
-* [FoundationDBStatusMovingData](#foundationdbstatusmovingdata)
-* [FoundationDBStatusProcessInfo](#foundationdbstatusprocessinfo)
-* [FoundationDBStatusSupportedVersion](#foundationdbstatussupportedversion)
 * [LockDenyListEntry](#lockdenylistentry)
 * [LockOptions](#lockoptions)
 * [LockSystemStatus](#locksystemstatus)
@@ -57,6 +41,7 @@ AutomaticReplacementOptions controls options for automatically replacing failed 
 | ----- | ----------- | ------ | -------- |
 | enabled | Enabled controls whether automatic replacements are enabled. The default is false. | *bool | false |
 | failureDetectionTimeSeconds | FailureDetectionTimeSeconds controls how long a process must be failed or missing before it is automatically replaced. The default is 1800 seconds, or 30 minutes. | *int | false |
+| maxConcurrentReplacements | MaxConcurrentReplacements controls how many automatic replacements are allowed to take part. This will take the list of current replacements and then calculate the difference between maxConcurrentReplacements and the size of the list. e.g. if currently 3 replacements are queued (e.g. in the instancesToRemove list) and maxConcurrentReplacements is 5 the operator is allowed to replace at most 2 process groups. Setting this to 0 will basically disable the automatic replacements. | *int | false |
 
 [Back to TOC](#table-of-contents)
 
@@ -67,6 +52,8 @@ BuggifyConfig provides options for injecting faults into a cluster for testing.
 | Field | Description | Scheme | Required |
 | ----- | ----------- | ------ | -------- |
 | noSchedule | NoSchedule defines a list of instance IDs that should fail to schedule. | []string | false |
+| crashLoop | CrashLoops defines a list of instance IDs that should be put into a crash looping state. | []string | false |
+| emptyMonitorConf | EmptyMonitorConf instructs the operator to update all of the fdbmonitor.conf files to have zero fdbserver processes configured. | bool | false |
 
 [Back to TOC](#table-of-contents)
 
@@ -114,9 +101,9 @@ ConnectionString models the contents of a cluster file in a structured way
 
 | Field | Description | Scheme | Required |
 | ----- | ----------- | ------ | -------- |
-| DatabaseName | DatabaseName provides an identifier for the database which persists across coordinator changes. | string | false |
-| GenerationID | GenerationID provides a unique ID for the current generation of coordinators. | string | false |
-| Coordinators | Coordinators provides the addresses of the current coordinators. | []string | false |
+| databaseName | DatabaseName provides an identifier for the database which persists across coordinator changes. | string | false |
+| generationID | GenerationID provides a unique ID for the current generation of coordinators. | string | false |
+| coordinators | Coordinators provides the addresses of the current coordinators. | []string | false |
 
 [Back to TOC](#table-of-contents)
 
@@ -126,6 +113,7 @@ ContainerOverrides provides options for customizing a container created by the o
 
 | Field | Description | Scheme | Required |
 | ----- | ----------- | ------ | -------- |
+| enableLivenessProbe | EnableLivenessProbe defines if the sidecar should have a livenessProbe in addition to the readinessProbe. This setting will be enabled per default in the 1.0.0 release. This setting will be ignored on the main container. | bool | false |
 | enableTls | EnableTLS controls whether we should be listening on a TLS connection. | bool | false |
 | peerVerificationRules | PeerVerificationRules provides the rules for what client certificates the process should accept. | string | false |
 | env | Env provides environment variables.  **Deprecated: Use the PodTemplate field instead.** | [][corev1.EnvVar](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.17/#envvar-v1-core) | false |
@@ -159,18 +147,6 @@ DatabaseConfiguration represents the configuration of the database
 | regions | Regions defines the regions that the database can replicate in. | [][Region](#region) | false |
 | RoleCounts | RoleCounts defines how many processes the database should recruit for each role. | [RoleCounts](#rolecounts) | true |
 | VersionFlags | VersionFlags defines internal flags for testing new features in the database. | [VersionFlags](#versionflags) | true |
-
-[Back to TOC](#table-of-contents)
-
-## FdbVersion
-
-FdbVersion represents a version of FoundationDB.  This provides convenience methods for checking features available in different versions.
-
-| Field | Description | Scheme | Required |
-| ----- | ----------- | ------ | -------- |
-| Major | Major is the major version | int | false |
-| Minor | Minor is the minor version | int | false |
-| Patch | Patch is the patch version | int | false |
 
 [Back to TOC](#table-of-contents)
 
@@ -236,6 +212,7 @@ FoundationDBClusterSpec defines the desired state of a cluster.
 | processes | Processes defines process-level settings. | map[ProcessClass][ProcessSettings](#processsettings) | false |
 | processCounts | ProcessCounts defines the number of processes to configure for each process class. You can generally omit this, to allow the operator to infer the process counts based on the database configuration. | [ProcessCounts](#processcounts) | false |
 | seedConnectionString | SeedConnectionString provides a connection string for the initial reconciliation.  After the initial reconciliation, this will not be used. | string | false |
+| partialConnectionString | PartialConnectionString provides a way to specify part of the connection string (e.g. the database name and coordinator generation) without specifying the entire string. This does not allow for setting the coordinator IPs. If `SeedConnectionString` is set, `PartialConnectionString` will have no effect. They cannot be used together. | [ConnectionString](#connectionstring) | false |
 | faultDomain | FaultDomain defines the rules for what fault domain to replicate across. | [FoundationDBClusterFaultDomain](#foundationdbclusterfaultdomain) | false |
 | instancesToRemove | InstancesToRemove defines the instances that we should remove from the cluster. This list contains the instance IDs. | []string | false |
 | instancesToRemoveWithoutExclusion | InstancesToRemoveWithoutExclusion defines the instances that we should remove from the cluster without excluding them. This list contains the instance IDs.  This should be used for cases where a pod does not have an IP address and you want to remove it and destroy its volume without confirming the data is fully replicated. | []string | false |
@@ -273,6 +250,9 @@ FoundationDBClusterSpec defines the desired state of a cluster.
 | customParameters | CustomParameters defines additional parameters to pass to the fdbserver processes. **Deprecated: use the Processes field instead.** | []string | false |
 | pendingRemovals | PendingRemovals defines the processes that are pending removal. This maps the name of a pod to its IP address. If a value is left blank, the controller will provide the pod's current IP.  **Deprecated: To indicate that a process should be removed, use the InstancesToRemove field. To get information about pending removals, use the PendingRemovals field in the status.** | map[string]string | false |
 | storageServersPerPod | StorageServersPerPod defines how many Storage Servers should run in a single Instance (Pod). This number defines the number of processes running in one Pod whereas the ProcessCounts defines the number of Pods created. This means that you end up with ProcessCounts[\"storage\"] * StorageServersPerPod storage processes | int | false |
+| minimumUptimeSecondsForBounce | MinimumUptimeSecondsForBounce defines the minimum time, in seconds, that the processes in the cluster must have been up for before the operator can execute a bounce. | int | false |
+| replaceInstancesWhenResourcesChange | ReplaceInstancesWhenResourcesChange defines if an instance should be replaced when the resource requirements are increased. This can be useful with the combination of local storage. | *bool | false |
+| skip | Skip defines if the cluster should be skipped for reconciliation. This can be useful for investigating in issues or if the environment is unstable. | bool | false |
 
 [Back to TOC](#table-of-contents)
 
@@ -302,184 +282,6 @@ FoundationDBClusterStatus defines the observed state of FoundationDBCluster
 | storageServersPerDisk | StorageServersPerDisk defines the storageServersPerPod observed in the cluster. If there are more than one value in the slice the reconcile phase is not finished. | []int | false |
 | processGroups | ProcessGroups contain information about a process group. This information is used in multiple places to trigger the according action. | []*[ProcessGroupStatus](#processgroupstatus) | false |
 | locks | Locks contains information about the locking system. | [LockSystemStatus](#locksystemstatus) | false |
-
-[Back to TOC](#table-of-contents)
-
-## FoundationDBStatus
-
-FoundationDBStatus describes the status of the cluster as provided by FoundationDB itself.
-
-| Field | Description | Scheme | Required |
-| ----- | ----------- | ------ | -------- |
-| client | Client provides the client section of the status. | [FoundationDBStatusLocalClientInfo](#foundationdbstatuslocalclientinfo) | false |
-| cluster | Cluster provides the cluster section of the status. | [FoundationDBStatusClusterInfo](#foundationdbstatusclusterinfo) | false |
-
-[Back to TOC](#table-of-contents)
-
-## FoundationDBStatusBackupInfo
-
-FoundationDBStatusBackupInfo provides information about backups that have been started.
-
-| Field | Description | Scheme | Required |
-| ----- | ----------- | ------ | -------- |
-| paused | Paused tells whether the backups are paused. | bool | false |
-| tags | Tags provides information about specific backups. | map[string][FoundationDBStatusBackupTag](#foundationdbstatusbackuptag) | false |
-
-[Back to TOC](#table-of-contents)
-
-## FoundationDBStatusBackupTag
-
-FoundationDBStatusBackupTag provides information about a backup under a tag in the cluster status.
-
-| Field | Description | Scheme | Required |
-| ----- | ----------- | ------ | -------- |
-| current_container |  | string | false |
-| running_backup |  | bool | false |
-| running_backup_is_restorable |  | bool | false |
-
-[Back to TOC](#table-of-contents)
-
-## FoundationDBStatusClientDBStatus
-
-FoundationDBStatusClientDBStatus represents the databaseStatus field in the JSON database status
-
-| Field | Description | Scheme | Required |
-| ----- | ----------- | ------ | -------- |
-| available | Available indicates whether the database is accepting traffic. | bool | false |
-| healthy | Healthy indicates whether the database is fully healthy. | bool | false |
-
-[Back to TOC](#table-of-contents)
-
-## FoundationDBStatusClusterClientInfo
-
-FoundationDBStatusClusterClientInfo represents the connected client details in the cluster status.
-
-| Field | Description | Scheme | Required |
-| ----- | ----------- | ------ | -------- |
-| count | Count provides the number of clients connected to the database. | int | false |
-| supported_versions | SupportedVersions provides information about the versions supported by the connected clients. | [][FoundationDBStatusSupportedVersion](#foundationdbstatussupportedversion) | false |
-
-[Back to TOC](#table-of-contents)
-
-## FoundationDBStatusClusterInfo
-
-FoundationDBStatusClusterInfo describes the \"cluster\" portion of the cluster status
-
-| Field | Description | Scheme | Required |
-| ----- | ----------- | ------ | -------- |
-| configuration | DatabaseConfiguration describes the current configuration of the database. | [DatabaseConfiguration](#databaseconfiguration) | false |
-| processes | Processes provides details on the processes that are reporting to the cluster. | map[string][FoundationDBStatusProcessInfo](#foundationdbstatusprocessinfo) | false |
-| data | Data provides information about the data in the database. | [FoundationDBStatusDataStatistics](#foundationdbstatusdatastatistics) | false |
-| full_replication | FullReplication indicates whether the database is fully replicated. | bool | false |
-| clients | Clients provides information about clients that are connected to the database. | [FoundationDBStatusClusterClientInfo](#foundationdbstatusclusterclientinfo) | false |
-| layers | Layers provides information about layers that are running against the cluster. | [FoundationDBStatusLayerInfo](#foundationdbstatuslayerinfo) | false |
-
-[Back to TOC](#table-of-contents)
-
-## FoundationDBStatusConnectedClient
-
-FoundationDBStatusConnectedClient provides information about a client that is connected to the database.
-
-| Field | Description | Scheme | Required |
-| ----- | ----------- | ------ | -------- |
-| address | Address provides the address the client is connecting from. | string | false |
-| log_group | LogGroup provides the trace log group the client has set. | string | false |
-
-[Back to TOC](#table-of-contents)
-
-## FoundationDBStatusCoordinator
-
-FoundationDBStatusCoordinator contains information about one of the coordinators.
-
-| Field | Description | Scheme | Required |
-| ----- | ----------- | ------ | -------- |
-| address | Address provides the coordinator's address. | string | false |
-| reachable | Reachable indicates whether the coordinator is reachable. | bool | false |
-
-[Back to TOC](#table-of-contents)
-
-## FoundationDBStatusCoordinatorInfo
-
-FoundationDBStatusCoordinatorInfo contains information about the client's connection to the coordinators.
-
-| Field | Description | Scheme | Required |
-| ----- | ----------- | ------ | -------- |
-| coordinators | Coordinators provides a list with coordinator details. | [][FoundationDBStatusCoordinator](#foundationdbstatuscoordinator) | false |
-
-[Back to TOC](#table-of-contents)
-
-## FoundationDBStatusDataStatistics
-
-FoundationDBStatusDataStatistics provides information about the data in the database
-
-| Field | Description | Scheme | Required |
-| ----- | ----------- | ------ | -------- |
-| total_kv_size_bytes | KVBytes provides the total Key Value Bytes in the database. | int | false |
-| moving_data | MovingData provides information about the current data movement. | [FoundationDBStatusMovingData](#foundationdbstatusmovingdata) | false |
-
-[Back to TOC](#table-of-contents)
-
-## FoundationDBStatusLayerInfo
-
-FoundationDBStatusLayerInfo provides information about layers that are running against the cluster.
-
-| Field | Description | Scheme | Required |
-| ----- | ----------- | ------ | -------- |
-| backup | Backup provides information about backups that have been started. | [FoundationDBStatusBackupInfo](#foundationdbstatusbackupinfo) | false |
-| _error | The error from the layer status. | string | false |
-
-[Back to TOC](#table-of-contents)
-
-## FoundationDBStatusLocalClientInfo
-
-FoundationDBStatusLocalClientInfo contains information about the client connection from the process getting the status.
-
-| Field | Description | Scheme | Required |
-| ----- | ----------- | ------ | -------- |
-| coordinators | Coordinators provides information about the cluster's coordinators. | [FoundationDBStatusCoordinatorInfo](#foundationdbstatuscoordinatorinfo) | false |
-| database_status | DatabaseStatus provides a summary of the database's health. | [FoundationDBStatusClientDBStatus](#foundationdbstatusclientdbstatus) | false |
-
-[Back to TOC](#table-of-contents)
-
-## FoundationDBStatusMovingData
-
-FoundationDBStatusMovingData provides information about the current data movement
-
-| Field | Description | Scheme | Required |
-| ----- | ----------- | ------ | -------- |
-| highest_priority | HighestPriority provides the priority of the highest-priority data movement. | int | false |
-| in_flight_bytes | InFlightBytes provides how many bytes are being actively moved. | int | false |
-| in_queue_bytes | InQueueBytes provides how many bytes are pending data movement. | int | false |
-
-[Back to TOC](#table-of-contents)
-
-## FoundationDBStatusProcessInfo
-
-FoundationDBStatusProcessInfo describes the \"processes\" portion of the cluster status
-
-| Field | Description | Scheme | Required |
-| ----- | ----------- | ------ | -------- |
-| address | Address provides the address of the process. | string | false |
-| class_type | ProcessClass provides the process class the process has been given. | ProcessClass | false |
-| command_line | CommandLine provides the command-line invocation for the process. | string | false |
-| excluded | Excluded indicates whether the process has been excluded. | bool | false |
-| locality | The locality information for the process. | map[string]string | false |
-| version | The version of FoundationDB the process is running. | string | false |
-| uptime_seconds | The time that the process has been up for. | float64 | false |
-
-[Back to TOC](#table-of-contents)
-
-## FoundationDBStatusSupportedVersion
-
-FoundationDBStatusSupportedVersion provides information about a version of FDB supported by the connected clients.
-
-| Field | Description | Scheme | Required |
-| ----- | ----------- | ------ | -------- |
-| client_version | ClientVersion provides the version of FDB the client is connecting through. | string | false |
-| connected_clients | ConnectedClient provides the clients that are using this version. | [][FoundationDBStatusConnectedClient](#foundationdbstatusconnectedclient) | true |
-| max_protocol_clients | MaxProtocolClients provides the clients that are using this version as their highest supported protocol version. | [][FoundationDBStatusConnectedClient](#foundationdbstatusconnectedclient) | true |
-| protocol_version | ProtocolVersion is the version of the wire protocol the client is using. | string | false |
-| source_version | SourceVersion is the version of the source code that the client library was built from. | string | false |
 
 [Back to TOC](#table-of-contents)
 
@@ -549,21 +351,51 @@ ProcessCounts represents the number of processes we have for each valid process 
 
 | Field | Description | Scheme | Required |
 | ----- | ----------- | ------ | -------- |
-| storage | Storage defines the number of storage class processes. | int | false |
-| transaction | Transaction defines the number of transaction class processes. | int | false |
-| stateless | Stateless defines the number of stateless class processes. | int | false |
-| resolution | Resolution defines the number of resolution class processes. | int | false |
 | unset |  | int | false |
-| log |  | int | false |
-| master |  | int | false |
-| cluster_controller |  | int | false |
+| storage |  | int | false |
+| transaction |  | int | false |
+| resolution |  | int | false |
+| tester |  | int | false |
 | proxy |  | int | false |
-| resolver |  | int | false |
+| master |  | int | false |
+| stateless |  | int | false |
+| log |  | int | false |
+| cluster_controller |  | int | false |
 | router |  | int | false |
-| ratekeeper |  | int | false |
-| data_distributor |  | int | false |
 | fast_restore |  | int | false |
+| data_distributor |  | int | false |
+| coordinator |  | int | false |
+| ratekeeper |  | int | false |
+| storage_cache |  | int | false |
 | backup |  | int | false |
+| resolver | **Deprecated: This is unsupported and any processes with this process class will fail to start.** | int | false |
+
+[Back to TOC](#table-of-contents)
+
+## ProcessGroupCondition
+
+ProcessGroupCondition represents a degraded condition that a process group is in.
+
+| Field | Description | Scheme | Required |
+| ----- | ----------- | ------ | -------- |
+| type | Name of the condition | ProcessGroupConditionType | false |
+| timestamp | Timestamp when the Condition was observed | int64 | false |
+
+[Back to TOC](#table-of-contents)
+
+## ProcessGroupStatus
+
+ProcessGroupStatus represents a the status of a ProcessGroup.
+
+| Field | Description | Scheme | Required |
+| ----- | ----------- | ------ | -------- |
+| processGroupID | ProcessGroupID represents the ID of the process group | string | false |
+| processClass | ProcessClass represents the class the process group has. | ProcessClass | false |
+| addresses | Addresses represents the list of addresses the process group has been known to have. | []string | false |
+| remove | Remove defines if the process group is marked for removal. | bool | false |
+| excluded | Excluded defines if the process group has been fully excluded. This is only used within the reconciliation process, and should not be considered authoritative. | bool | false |
+| exclusionSkipped | ExclusionSkipped determines if exclusion has been skipped for a process, which will allow the process group to be removed without exclusion. | bool | false |
+| processGroupConditions | ProcessGroupConditions represents a list of degraded conditions that the process group is in. | []*[ProcessGroupCondition](#processgroupcondition) | false |
 
 [Back to TOC](#table-of-contents)
 
@@ -604,6 +436,7 @@ ProcessSettings defines process-level settings.
 | volumeClaim | VolumeClaim allows customizing the persistent volume claim for the pod. **Deprecated: Use the VolumeClaimTemplate field instead.** | *[corev1.PersistentVolumeClaim](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.17/#persistentvolumeclaim-v1-core) | false |
 | volumeClaimTemplate | VolumeClaimTemplate allows customizing the persistent volume claim for the pod. | *[corev1.PersistentVolumeClaim](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.17/#persistentvolumeclaim-v1-core) | false |
 | customParameters | CustomParameters defines additional parameters to pass to the fdbserver process. | *[]string | false |
+| allowTagOverride | This setting defines if a user provided image can have it's own tag rather than getting the provided version appended. You have to ensure that the specified version in the Spec is compatible with the given version in your custom image. | *bool | false |
 
 [Back to TOC](#table-of-contents)
 

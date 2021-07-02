@@ -71,10 +71,13 @@ func NewRootCmd(streams genericclioptions.IOStreams) *cobra.Command {
 	o.configFlags.AddFlags(cmd.Flags())
 
 	cmd.AddCommand(
-		newVersionCmd(streams, cmd),
-		newRemoveCmd(streams, cmd),
+		newVersionCmd(streams),
+		newRemoveCmd(streams),
 		newExecCmd(streams),
-		newCordonCmd(streams, cmd),
+		newCordonCmd(streams),
+		newRestartCmd(streams),
+		newAnalyzeCmd(streams),
+		newDeprecationCmd(streams),
 	)
 
 	return cmd

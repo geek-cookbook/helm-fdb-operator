@@ -21,6 +21,7 @@
 package controllers
 
 import (
+	"context"
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
@@ -32,9 +33,10 @@ import (
 	"net/http"
 	"os"
 	"strings"
-	"sync"
+	"time"
 
 	fdbtypes "github.com/FoundationDB/fdb-kubernetes-operator/api/v1beta1"
+	"github.com/hashicorp/go-retryablehttp"
 	corev1 "k8s.io/api/core/v1"
 )
 
@@ -143,30 +145,39 @@ func (client *realFdbPodClient) getListenIP() string {
 
 // makeRequest submits a request to the sidecar.
 func (client *realFdbPodClient) makeRequest(method string, path string) (string, error) {
-	var protocol string
-	if client.useTLS {
-		protocol = "https"
-	} else {
-		protocol = "http"
-	}
-
-	url := fmt.Sprintf("%s://%s:8080/%s", protocol, client.getListenIP(), path)
 	var resp *http.Response
 	var err error
 
-	httpClient := &http.Client{}
-	if client.useTLS {
-		httpClient.Transport = &http.Transport{TLSClientConfig: client.tlsConfig}
+	protocol := "http"
+	retryClient := retryablehttp.NewClient()
+	retryClient.RetryMax = 10
+	retryClient.RetryWaitMax = 5 * time.Second
+	// Prevent logging
+	retryClient.Logger = nil
+	retryClient.CheckRetry = func(c context.Context, resp *http.Response, err error) (bool, error) {
+		if c.Err() != nil && err != nil && resp != nil && resp.StatusCode >= 400 {
+			return true, nil
+		}
+
+		// All other go to default policy
+		return retryablehttp.DefaultRetryPolicy(c, resp, err)
 	}
 
+	if client.useTLS {
+		retryClient.HTTPClient.Transport = &http.Transport{TLSClientConfig: client.tlsConfig}
+		protocol = "https"
+	}
+
+	url := fmt.Sprintf("%s://%s:8080/%s", protocol, client.getListenIP(), path)
 	switch method {
 	case "GET":
-		resp, err = httpClient.Get(url)
+		resp, err = retryClient.Get(url)
 	case "POST":
-		resp, err = httpClient.Post(url, "application/json", strings.NewReader(""))
+		resp, err = retryClient.Post(url, "application/json", strings.NewReader(""))
 	default:
-		return "", fmt.Errorf("Unknown HTTP method %s", method)
+		return "", fmt.Errorf("unknown HTTP method %s", method)
 	}
+
 	if err != nil {
 		return "", err
 	}
@@ -183,6 +194,7 @@ func (client *realFdbPodClient) makeRequest(method string, path string) (string,
 	if resp.StatusCode >= 400 {
 		return "", failedResponse{response: resp, body: bodyText}
 	}
+
 	return bodyText, nil
 }
 
@@ -248,34 +260,6 @@ func NewMockFdbPodClient(cluster *fdbtypes.FoundationDBCluster, pod *corev1.Pod)
 	return &mockFdbPodClient{Cluster: cluster, Pod: pod}, nil
 }
 
-var mockMissingPodIPs map[string]bool
-var mockPodClientMutex sync.Mutex
-
-// MockPodIP generates a mock IP for FDB pod
-func MockPodIP(pod *corev1.Pod) string {
-	mockPodClientMutex.Lock()
-	defer mockPodClientMutex.Unlock()
-
-	if mockMissingPodIPs != nil && mockMissingPodIPs[pod.ObjectMeta.Name] {
-		return ""
-	}
-	components := strings.Split(GetInstanceIDFromMeta(pod.ObjectMeta), "-")
-	for index, class := range fdbtypes.ProcessClasses {
-		if string(class) == components[len(components)-2] {
-			return fmt.Sprintf("1.1.%d.%s", index, components[len(components)-1])
-		}
-	}
-	return "0.0.0.0"
-}
-
-// setMissingPodIPs sets the pod IPs that should be missing when fetching mock
-// pod IPs.
-func setMissingPodIPs(ips map[string]bool) {
-	mockPodClientMutex.Lock()
-	defer mockPodClientMutex.Unlock()
-	mockMissingPodIPs = ips
-}
-
 // GetCluster returns the cluster associated with a client
 func (client *mockFdbPodClient) GetCluster() *fdbtypes.FoundationDBCluster {
 	return client.Cluster
@@ -320,13 +304,18 @@ func UpdateDynamicFiles(client FdbPodClient, filename string, contents string, u
 	}
 
 	if !match {
-		log.Info("Waiting for config update", "namespace", client.GetPod().Namespace, "pod", client.GetPod().Name, "file", filename)
 		err = updateFunc(client)
 		if err != nil {
 			return false, err
 		}
 
-		return client.CheckHash(filename, contents)
+		// We check this more or less instantly, maybe we should add some delay?
+		match, err = client.CheckHash(filename, contents)
+		if !match {
+			log.Info("Waiting for config update", "namespace", client.GetPod().Namespace, "pod", client.GetPod().Name, "file", filename)
+		}
+
+		return match, err
 	}
 
 	return true, nil
@@ -347,7 +336,8 @@ func CheckDynamicFilePresent(client FdbPodClient, filename string) (bool, error)
 // instance will substitute into its monitor conf.
 func (client *mockFdbPodClient) GetVariableSubstitutions() (map[string]string, error) {
 	substitutions := map[string]string{}
-	substitutions["FDB_PUBLIC_IP"] = MockPodIP(client.Pod)
+
+	substitutions["FDB_PUBLIC_IP"] = newFdbInstance(*client.Pod).GetPublicIPs()[0]
 	if client.Cluster.Spec.FaultDomain.Key == "foundationdb.org/none" {
 		substitutions["FDB_MACHINE_ID"] = client.Pod.Name
 		substitutions["FDB_ZONE_ID"] = client.Pod.Name
@@ -364,7 +354,7 @@ func (client *mockFdbPodClient) GetVariableSubstitutions() (map[string]string, e
 		if faultDomainSource == "spec.nodeName" {
 			substitutions["FDB_ZONE_ID"] = client.Pod.Spec.NodeName
 		} else {
-			return nil, fmt.Errorf("Unsupported fault domain source %s", faultDomainSource)
+			return nil, fmt.Errorf("unsupported fault domain source %s", faultDomainSource)
 		}
 	}
 
@@ -404,6 +394,8 @@ func (err fdbPodClientError) Error() string {
 	switch err {
 	case fdbPodClientErrorNoIP:
 		return "Pod does not have an IP address"
+	case fdbPodClientErrorNotReady:
+		return "Pod is not ready to receive traffic"
 	default:
 		return fmt.Sprintf("Unknown error code %d", err)
 	}

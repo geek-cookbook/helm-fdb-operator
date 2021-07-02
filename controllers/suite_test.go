@@ -22,9 +22,10 @@ package controllers
 
 import (
 	"context"
-	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/FoundationDB/fdb-kubernetes-operator/internal"
 
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
@@ -38,7 +39,6 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
-	"sigs.k8s.io/controller-runtime/pkg/envtest"
 	"sigs.k8s.io/controller-runtime/pkg/envtest/printer"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
@@ -50,7 +50,6 @@ import (
 // http://onsi.github.io/ginkgo/ to learn more about Ginkgo.
 
 var k8sClient *mockclient.MockClient
-var testEnv *envtest.Environment
 var clusterReconciler *FoundationDBClusterReconciler
 var backupReconciler *FoundationDBBackupReconciler
 var restoreReconciler *FoundationDBRestoreReconciler
@@ -66,16 +65,7 @@ func TestAPIs(t *testing.T) {
 var _ = BeforeSuite(func(done Done) {
 	logf.SetLogger(zap.New(zap.UseDevMode(true), zap.WriteTo(GinkgoWriter)))
 
-	By("bootstrapping test environment")
-	testEnv = &envtest.Environment{
-		CRDDirectoryPaths: []string{filepath.Join("..", "config", "crd", "bases")},
-	}
-
-	cfg, err := testEnv.Start()
-	Expect(err).ToNot(HaveOccurred())
-	Expect(cfg).ToNot(BeNil())
-
-	err = scheme.AddToScheme(scheme.Scheme)
+	err := scheme.AddToScheme(scheme.Scheme)
 	Expect(err).NotTo(HaveOccurred())
 	err = fdbtypes.AddToScheme(scheme.Scheme)
 	Expect(err).NotTo(HaveOccurred())
@@ -87,19 +77,19 @@ var _ = BeforeSuite(func(done Done) {
 	clusterReconciler = createTestClusterReconciler()
 
 	backupReconciler = &FoundationDBBackupReconciler{
-		Client:              k8sClient,
-		Log:                 ctrl.Log.WithName("controllers").WithName("FoundationDBBackup"),
-		Recorder:            k8sClient,
-		InSimulation:        true,
-		AdminClientProvider: NewMockAdminClient,
+		Client:                 k8sClient,
+		Log:                    ctrl.Log.WithName("controllers").WithName("FoundationDBBackup"),
+		Recorder:               k8sClient,
+		InSimulation:           true,
+		DatabaseClientProvider: mockDatabaseClientProvider{},
 	}
 
 	restoreReconciler = &FoundationDBRestoreReconciler{
-		Client:              k8sClient,
-		Log:                 ctrl.Log.WithName("controllers").WithName("FoundationDBRestore"),
-		Recorder:            k8sClient,
-		InSimulation:        true,
-		AdminClientProvider: NewMockAdminClient,
+		Client:                 k8sClient,
+		Log:                    ctrl.Log.WithName("controllers").WithName("FoundationDBRestore"),
+		Recorder:               k8sClient,
+		InSimulation:           true,
+		DatabaseClientProvider: mockDatabaseClientProvider{},
 	}
 
 	close(done)
@@ -108,8 +98,6 @@ var _ = BeforeSuite(func(done Done) {
 var _ = AfterSuite(func() {
 	By("tearing down the test environment")
 	gexec.KillAndWait(5 * time.Second)
-	err := testEnv.Stop()
-	Expect(err).ToNot(HaveOccurred())
 })
 
 var _ = AfterEach(func() {
@@ -117,30 +105,6 @@ var _ = AfterEach(func() {
 	ClearMockAdminClients()
 	ClearMockLockClients()
 })
-
-var Versions = struct {
-	NextMajorVersion, NextPatchVersion,
-	WithSidecarInstanceIDSubstitution, WithoutSidecarInstanceIDSubstitution,
-	WithCommandLineVariablesForSidecar, WithEnvironmentVariablesForSidecar,
-	WithBinariesFromMainContainer, WithoutBinariesFromMainContainer,
-	WithRatekeeperRole, WithoutRatekeeperRole,
-	WithSidecarCrashOnEmpty, WithoutSidecarCrashOnEmpty,
-	Default fdbtypes.FdbVersion
-}{
-	Default:                              fdbtypes.FdbVersion{Major: 6, Minor: 2, Patch: 20},
-	NextPatchVersion:                     fdbtypes.FdbVersion{Major: 6, Minor: 2, Patch: 21},
-	NextMajorVersion:                     fdbtypes.FdbVersion{Major: 7, Minor: 0, Patch: 0},
-	WithSidecarInstanceIDSubstitution:    fdbtypes.FdbVersion{Major: 6, Minor: 2, Patch: 15},
-	WithoutSidecarInstanceIDSubstitution: fdbtypes.FdbVersion{Major: 6, Minor: 2, Patch: 11},
-	WithCommandLineVariablesForSidecar:   fdbtypes.FdbVersion{Major: 6, Minor: 2, Patch: 15},
-	WithEnvironmentVariablesForSidecar:   fdbtypes.FdbVersion{Major: 6, Minor: 2, Patch: 11},
-	WithBinariesFromMainContainer:        fdbtypes.FdbVersion{Major: 6, Minor: 2, Patch: 15},
-	WithoutBinariesFromMainContainer:     fdbtypes.FdbVersion{Major: 6, Minor: 2, Patch: 11},
-	WithRatekeeperRole:                   fdbtypes.FdbVersion{Major: 6, Minor: 2, Patch: 15},
-	WithoutRatekeeperRole:                fdbtypes.FdbVersion{Major: 6, Minor: 1, Patch: 12},
-	WithSidecarCrashOnEmpty:              fdbtypes.FdbVersion{Major: 6, Minor: 2, Patch: 20},
-	WithoutSidecarCrashOnEmpty:           fdbtypes.FdbVersion{Major: 6, Minor: 2, Patch: 15},
-}
 
 func createDefaultCluster() *fdbtypes.FoundationDBCluster {
 	trueValue := true
@@ -152,7 +116,7 @@ func createDefaultCluster() *fdbtypes.FoundationDBCluster {
 			Namespace: "my-ns",
 		},
 		Spec: fdbtypes.FoundationDBClusterSpec{
-			Version: Versions.Default.String(),
+			Version: fdbtypes.Versions.Default.String(),
 			ProcessCounts: fdbtypes.ProcessCounts{
 				Storage:           4,
 				ClusterController: 1,
@@ -166,6 +130,7 @@ func createDefaultCluster() *fdbtypes.FoundationDBCluster {
 					FailureDetectionTimeSeconds: &failureDetectionWindow,
 				},
 			},
+			MinimumUptimeSecondsForBounce: 1,
 		},
 		Status: fdbtypes.FoundationDBClusterStatus{
 			RequiredAddresses: fdbtypes.RequiredAddressSet{
@@ -251,7 +216,6 @@ func reconcileObject(reconciler reconcile.Reconciler, metadata metav1.ObjectMeta
 }
 
 func setupClusterForTest(cluster *fdbtypes.FoundationDBCluster) error {
-
 	err := k8sClient.Create(context.TODO(), cluster)
 	if err != nil {
 		return err
@@ -267,7 +231,7 @@ func setupClusterForTest(cluster *fdbtypes.FoundationDBCluster) error {
 		return err
 	}
 
-	err = NormalizeClusterSpec(&cluster.Spec, DeprecationOptions{})
+	err = internal.NormalizeClusterSpec(&cluster.Spec, internal.DeprecationOptions{})
 	if err != nil {
 		return err
 	}
@@ -277,14 +241,12 @@ func setupClusterForTest(cluster *fdbtypes.FoundationDBCluster) error {
 
 func createTestClusterReconciler() *FoundationDBClusterReconciler {
 	return &FoundationDBClusterReconciler{
-		Client:              k8sClient,
-		Log:                 ctrl.Log.WithName("controllers").WithName("FoundationDBCluster"),
-		Recorder:            k8sClient,
-		InSimulation:        true,
-		PodLifecycleManager: StandardPodLifecycleManager{},
-		PodClientProvider:   NewMockFdbPodClient,
-		PodIPProvider:       MockPodIP,
-		AdminClientProvider: NewMockAdminClient,
-		LockClientProvider:  NewMockLockClient,
+		Client:                 k8sClient,
+		Log:                    ctrl.Log.WithName("controllers").WithName("FoundationDBCluster"),
+		Recorder:               k8sClient,
+		InSimulation:           true,
+		PodLifecycleManager:    StandardPodLifecycleManager{},
+		PodClientProvider:      NewMockFdbPodClient,
+		DatabaseClientProvider: mockDatabaseClientProvider{},
 	}
 }

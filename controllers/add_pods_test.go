@@ -24,6 +24,8 @@ import (
 	"context"
 	"sort"
 
+	"github.com/FoundationDB/fdb-kubernetes-operator/internal"
+
 	fdbtypes "github.com/FoundationDB/fdb-kubernetes-operator/api/v1beta1"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
@@ -33,13 +35,13 @@ import (
 var _ = Describe("add_pods", func() {
 	var cluster *fdbtypes.FoundationDBCluster
 	var err error
-	var shouldContinue bool
+	var requeue *Requeue
 	var initialPods *corev1.PodList
 	var newPods *corev1.PodList
 
 	BeforeEach(func() {
 		cluster = createDefaultCluster()
-		err = NormalizeClusterSpec(&cluster.Spec, DeprecationOptions{})
+		err = internal.NormalizeClusterSpec(&cluster.Spec, internal.DeprecationOptions{})
 		Expect(err).NotTo(HaveOccurred())
 
 		err = k8sClient.Create(context.TODO(), cluster)
@@ -59,7 +61,7 @@ var _ = Describe("add_pods", func() {
 	})
 
 	JustBeforeEach(func() {
-		shouldContinue, err = AddPods{}.Reconcile(clusterReconciler, context.TODO(), cluster)
+		requeue = AddPods{}.Reconcile(clusterReconciler, context.TODO(), cluster)
 		Expect(err).NotTo(HaveOccurred())
 		_, err = reloadCluster(cluster)
 		Expect(err).NotTo(HaveOccurred())
@@ -74,7 +76,7 @@ var _ = Describe("add_pods", func() {
 
 	Context("with a reconciled cluster", func() {
 		It("should not requeue", func() {
-			Expect(shouldContinue).To(BeTrue())
+			Expect(requeue).To(BeNil())
 		})
 
 		It("should not create any pods", func() {
@@ -88,15 +90,15 @@ var _ = Describe("add_pods", func() {
 		})
 
 		It("should not requeue", func() {
-			Expect(shouldContinue).To(BeTrue())
+			Expect(requeue).To(BeNil())
 		})
 
 		It("should create an extra pod", func() {
 			Expect(newPods.Items).To(HaveLen(len(initialPods.Items) + 1))
 			lastPod := newPods.Items[len(newPods.Items)-1]
 			Expect(lastPod.Name).To(Equal("operator-test-1-storage-9"))
-			Expect(lastPod.Labels[FDBInstanceIDLabel]).To(Equal("storage-9"))
-			Expect(lastPod.Labels[FDBProcessClassLabel]).To(Equal("storage"))
+			Expect(lastPod.Labels[fdbtypes.FDBInstanceIDLabel]).To(Equal("storage-9"))
+			Expect(lastPod.Labels[fdbtypes.FDBProcessClassLabel]).To(Equal("storage"))
 			Expect(lastPod.OwnerReferences).To(Equal(buildOwnerReference(cluster.TypeMeta, cluster.ObjectMeta)))
 		})
 
@@ -106,7 +108,7 @@ var _ = Describe("add_pods", func() {
 			})
 
 			It("should not requeue", func() {
-				Expect(shouldContinue).To(BeTrue())
+				Expect(requeue).To(BeNil())
 			})
 
 			It("should not create any pods", func() {

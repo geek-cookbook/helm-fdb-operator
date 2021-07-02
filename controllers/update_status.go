@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2019 Apple Inc. and the FoundationDB project authors
+ * Copyright 2019-2021 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -25,8 +25,9 @@ import (
 	"fmt"
 	"reflect"
 	"sort"
-	"strings"
 	"time"
+
+	"github.com/FoundationDB/fdb-kubernetes-operator/internal"
 
 	fdbtypes "github.com/FoundationDB/fdb-kubernetes-operator/api/v1beta1"
 
@@ -44,7 +45,8 @@ type UpdateStatus struct {
 }
 
 // Reconcile runs the reconciler's work.
-func (s UpdateStatus) Reconcile(r *FoundationDBClusterReconciler, context ctx.Context, cluster *fdbtypes.FoundationDBCluster) (bool, error) {
+func (s UpdateStatus) Reconcile(r *FoundationDBClusterReconciler, context ctx.Context, cluster *fdbtypes.FoundationDBCluster) *Requeue {
+	originalStatus := cluster.Status.DeepCopy()
 	status := fdbtypes.FoundationDBClusterStatus{}
 	status.Generations.Reconciled = cluster.Status.Generations.Reconciled
 
@@ -65,20 +67,20 @@ func (s UpdateStatus) Reconcile(r *FoundationDBClusterReconciler, context ctx.Co
 	} else {
 		version, connectionString, err := tryConnectionOptions(cluster, r)
 		if err != nil {
-			return false, err
+			return &Requeue{Error: err}
 		}
 		cluster.Status.RunningVersion = version
 		cluster.Status.ConnectionString = connectionString
 
-		adminClient, err := r.AdminClientProvider(cluster, r)
+		adminClient, err := r.getDatabaseClientProvider().GetAdminClient(cluster, r)
 		if err != nil {
-			return false, err
+			return &Requeue{Error: err}
 		}
 		defer adminClient.Close()
 
 		databaseStatus, err = adminClient.GetStatus()
 		if err != nil {
-			return false, err
+			return &Requeue{Error: err}
 		}
 	}
 
@@ -97,7 +99,7 @@ func (s UpdateStatus) Reconcile(r *FoundationDBClusterReconciler, context ctx.Co
 
 	instances, err := r.PodLifecycleManager.GetInstances(r, cluster, context, getPodListOptions(cluster, "", "")...)
 	if err != nil {
-		return false, err
+		return &Requeue{Error: err}
 	}
 
 	if cluster.Spec.MainContainer.EnableTLS {
@@ -110,7 +112,7 @@ func (s UpdateStatus) Reconcile(r *FoundationDBClusterReconciler, context ctx.Co
 		for _, coordinator := range databaseStatus.Client.Coordinators.Coordinators {
 			address, err := fdbtypes.ParseProcessAddress(coordinator.Address)
 			if err != nil {
-				return false, err
+				return &Requeue{Error: err}
 			}
 
 			if address.Flags["tls"] {
@@ -125,7 +127,7 @@ func (s UpdateStatus) Reconcile(r *FoundationDBClusterReconciler, context ctx.Co
 
 	configMap, err := GetConfigMap(cluster)
 	if err != nil {
-		return false, err
+		return &Requeue{Error: err}
 	}
 
 	status.ProcessGroups = make([]*fdbtypes.ProcessGroupStatus, 0, len(cluster.Status.ProcessGroups))
@@ -134,10 +136,11 @@ func (s UpdateStatus) Reconcile(r *FoundationDBClusterReconciler, context ctx.Co
 			status.ProcessGroups = append(status.ProcessGroups, processGroup)
 		}
 	}
+	removeDuplicateConditions(status)
 
 	status.ProcessGroups, err = validateInstances(r, context, cluster, &status, processMap, instances, configMap)
 	if err != nil {
-		return false, err
+		return &Requeue{Error: err}
 	}
 	removeDuplicateConditions(status)
 
@@ -145,49 +148,32 @@ func (s UpdateStatus) Reconcile(r *FoundationDBClusterReconciler, context ctx.Co
 	pvcs := &corev1.PersistentVolumeClaimList{}
 	err = r.List(context, pvcs, getPodListOptions(cluster, "", "")...)
 	if err != nil {
-		return false, err
+		return &Requeue{Error: err}
 	}
 
 	for _, pvc := range pvcs.Items {
-		processGroupID := pvc.Labels[FDBInstanceIDLabel]
+		processGroupID := pvc.Labels[fdbtypes.FDBInstanceIDLabel]
 		if fdbtypes.ContainsProcessGroupID(status.ProcessGroups, processGroupID) {
 			continue
 		}
 
-		status.ProcessGroups = append(status.ProcessGroups, fdbtypes.NewProcessGroupStatus(processGroupID, processClassFromLabels(pvc.Labels), nil))
+		status.ProcessGroups = append(status.ProcessGroups, fdbtypes.NewProcessGroupStatus(processGroupID, internal.ProcessClassFromLabels(pvc.Labels), nil))
 	}
 
 	// Track all Services
 	services := &corev1.ServiceList{}
 	err = r.List(context, services, getPodListOptions(cluster, "", "")...)
 	if err != nil {
-		return false, err
+		return &Requeue{Error: err}
 	}
 
 	for _, service := range services.Items {
-		processGroupID := service.Labels[FDBInstanceIDLabel]
+		processGroupID := service.Labels[fdbtypes.FDBInstanceIDLabel]
 		if processGroupID == "" || fdbtypes.ContainsProcessGroupID(status.ProcessGroups, processGroupID) {
 			continue
 		}
 
-		status.ProcessGroups = append(status.ProcessGroups, fdbtypes.NewProcessGroupStatus(processGroupID, processClassFromLabels(service.Labels), nil))
-	}
-
-	// Ensure that anything the user has explicitly chosen to remove is marked
-	// for removal.
-	for _, processGroupID := range cluster.Spec.InstancesToRemove {
-		for _, processGroup := range status.ProcessGroups {
-			if processGroup.ProcessGroupID == processGroupID {
-				processGroup.Remove = true
-			}
-		}
-	}
-	for _, processGroupID := range cluster.Spec.InstancesToRemoveWithoutExclusion {
-		for _, processGroup := range status.ProcessGroups {
-			if processGroup.ProcessGroupID == processGroupID {
-				processGroup.ExclusionSkipped = true
-			}
-		}
+		status.ProcessGroups = append(status.ProcessGroups, fdbtypes.NewProcessGroupStatus(processGroupID, internal.ProcessClassFromLabels(service.Labels), nil))
 	}
 
 	existingConfigMap := &corev1.ConfigMap{}
@@ -195,7 +181,7 @@ func (s UpdateStatus) Reconcile(r *FoundationDBClusterReconciler, context ctx.Co
 	if err != nil && k8serrors.IsNotFound(err) {
 		status.HasIncorrectConfigMap = true
 	} else if err != nil {
-		return false, err
+		return &Requeue{Error: err}
 	}
 
 	status.RunningVersion = cluster.Status.RunningVersion
@@ -213,7 +199,7 @@ func (s UpdateStatus) Reconcile(r *FoundationDBClusterReconciler, context ctx.Co
 
 	status.ConnectionString = cluster.Status.ConnectionString
 	if status.ConnectionString == "" {
-		status.ConnectionString = existingConfigMap.Data["cluster-file"]
+		status.ConnectionString = existingConfigMap.Data[clusterFileKey]
 	}
 
 	if status.ConnectionString == "" {
@@ -225,11 +211,11 @@ func (s UpdateStatus) Reconcile(r *FoundationDBClusterReconciler, context ctx.Co
 			pods := &corev1.PodList{}
 			err = r.List(context, pods, client.InNamespace(cluster.Namespace), client.MatchingFields{"metadata.name": podName})
 			if err != nil {
-				return false, err
+				return &Requeue{Error: err}
 			}
 			if len(pods.Items) > 0 {
-				instanceID := pods.Items[0].ObjectMeta.Labels[FDBInstanceIDLabel]
-				processClass := processClassFromLabels(pods.Items[0].ObjectMeta.Labels)
+				instanceID := pods.Items[0].ObjectMeta.Labels[fdbtypes.FDBInstanceIDLabel]
+				processClass := internal.ProcessClassFromLabels(pods.Items[0].ObjectMeta.Labels)
 				included, newStatus := fdbtypes.MarkProcessGroupForRemoval(status.ProcessGroups, instanceID, processClass, address)
 				if !included {
 					status.ProcessGroups = append(status.ProcessGroups, newStatus)
@@ -243,11 +229,11 @@ func (s UpdateStatus) Reconcile(r *FoundationDBClusterReconciler, context ctx.Co
 			pods := &corev1.PodList{}
 			err = r.List(context, pods, client.InNamespace(cluster.Namespace), client.MatchingFields{"metadata.name": state.PodName})
 			if err != nil {
-				return false, err
+				return &Requeue{Error: err}
 			}
 			var processClass fdbtypes.ProcessClass
 			if len(pods.Items) > 0 {
-				processClass = processClassFromLabels(pods.Items[0].ObjectMeta.Labels)
+				processClass = internal.ProcessClassFromLabels(pods.Items[0].ObjectMeta.Labels)
 			}
 			included, newStatus := fdbtypes.MarkProcessGroupForRemoval(status.ProcessGroups, instanceID, processClass, state.Address)
 			if !included {
@@ -265,7 +251,7 @@ func (s UpdateStatus) Reconcile(r *FoundationDBClusterReconciler, context ctx.Co
 	if err != nil && k8serrors.IsNotFound(err) {
 		existingService = nil
 	} else if err != nil {
-		return false, err
+		return &Requeue{Error: err}
 	}
 
 	status.HasIncorrectServiceConfig = (service == nil) != (existingService == nil)
@@ -278,9 +264,14 @@ func (s UpdateStatus) Reconcile(r *FoundationDBClusterReconciler, context ctx.Co
 	}
 
 	if status.Configured && cluster.Status.ConnectionString != "" {
-		coordinatorsValid, _, err := checkCoordinatorValidity(cluster, databaseStatus)
+		coordinatorStatus := make(map[string]bool, len(databaseStatus.Client.Coordinators.Coordinators))
+		for _, coordinator := range databaseStatus.Client.Coordinators.Coordinators {
+			coordinatorStatus[coordinator.Address] = false
+		}
+
+		coordinatorsValid, _, err := checkCoordinatorValidity(cluster, databaseStatus, coordinatorStatus)
 		if err != nil {
-			return false, err
+			return &Requeue{Error: err}
 		}
 
 		status.NeedsNewCoordinators = !coordinatorsValid
@@ -289,11 +280,11 @@ func (s UpdateStatus) Reconcile(r *FoundationDBClusterReconciler, context ctx.Co
 	if len(cluster.Spec.LockOptions.DenyList) > 0 && cluster.ShouldUseLocks() && status.Configured {
 		lockClient, err := r.getLockClient(cluster)
 		if err != nil {
-			return false, err
+			return &Requeue{Error: err}
 		}
 		denyList, err := lockClient.GetDenyList()
 		if err != nil {
-			return false, err
+			return &Requeue{Error: err}
 		}
 		if len(denyList) == 0 {
 			denyList = nil
@@ -303,8 +294,11 @@ func (s UpdateStatus) Reconcile(r *FoundationDBClusterReconciler, context ctx.Co
 
 	// Sort the storage servers per Disk to prevent a reodering to issue a new reconcile loop.
 	sort.Ints(status.StorageServersPerDisk)
-
-	originalStatus := cluster.Status.DeepCopy()
+	// Sort ProcessGroups by ProcessGroupID otherwise this can result in an endless loop when the
+	// order changes.
+	sort.SliceStable(status.ProcessGroups, func(i, j int) bool {
+		return status.ProcessGroups[i].ProcessGroupID < status.ProcessGroups[j].ProcessGroupID
+	})
 
 	// Sort ProcessGroups by ProcessGroupID otherwise this can result in an endless loop when the
 	// order changes.
@@ -316,7 +310,7 @@ func (s UpdateStatus) Reconcile(r *FoundationDBClusterReconciler, context ctx.Co
 
 	_, err = cluster.CheckReconciliation()
 	if err != nil {
-		return false, err
+		return &Requeue{Error: err}
 	}
 
 	// See: https://github.com/kubernetes-sigs/kubebuilder/issues/592
@@ -326,17 +320,11 @@ func (s UpdateStatus) Reconcile(r *FoundationDBClusterReconciler, context ctx.Co
 		err = r.Status().Update(context, cluster)
 		if err != nil {
 			log.Error(err, "Error updating cluster status", "namespace", cluster.Namespace, "cluster", cluster.Name)
-			return false, err
+			return &Requeue{Error: err}
 		}
 	}
 
-	return true, nil
-}
-
-// RequeueAfter returns the delay before we should run the reconciliation
-// again.
-func (s UpdateStatus) RequeueAfter() time.Duration {
-	return 0
+	return nil
 }
 
 // containsAll determines if one map contains all the keys and matching values
@@ -347,6 +335,7 @@ func containsAll(current map[string]string, desired map[string]string) bool {
 			return false
 		}
 	}
+
 	return true
 }
 
@@ -381,19 +370,17 @@ func tryConnectionOptions(cluster *fdbtypes.FoundationDBCluster, r *FoundationDB
 		"namespace", cluster.Namespace, "cluster", cluster.Name,
 		"version", versions, "connectionString", connectionStrings)
 
-	var firstError error = nil
-
 	defer func() { cluster.Status.RunningVersion = originalVersion }()
 	defer func() { cluster.Status.ConnectionString = originalConnectionString }()
 
 	for _, version := range versions {
 		for _, connectionString := range connectionStrings {
-			log.Info("Attempting to get status from cluster",
+			log.Info("Attempting to get connection string from cluster",
 				"namespace", cluster.Namespace, "cluster", cluster.Name,
 				"version", version, "connectionString", connectionString)
 			cluster.Status.RunningVersion = version
 			cluster.Status.ConnectionString = connectionString
-			adminClient, clientErr := r.AdminClientProvider(cluster, r)
+			adminClient, clientErr := r.getDatabaseClientProvider().GetAdminClient(cluster, r)
 
 			if clientErr != nil {
 				return originalVersion, originalConnectionString, clientErr
@@ -407,19 +394,16 @@ func tryConnectionOptions(cluster *fdbtypes.FoundationDBCluster, r *FoundationDB
 					"version", version, "connectionString", activeConnectionString)
 				return version, activeConnectionString, err
 			}
-			log.Error(err, "Error getting status from cluster",
+			log.Error(err, "Error getting connection string from cluster",
 				"namespace", cluster.Namespace, "cluster", cluster.Name,
 				"version", version, "connectionString", connectionString)
-			if firstError == nil {
-				firstError = err
-			}
 		}
 	}
-	return originalVersion, originalConnectionString, firstError
+	return originalVersion, originalConnectionString, nil
 }
 
 // CheckAndSetProcessStatus checks the status of the Process and if missing or incorrect add it to the related status field
-func CheckAndSetProcessStatus(r *FoundationDBClusterReconciler, cluster *fdbtypes.FoundationDBCluster, instance FdbInstance, processMap map[string][]fdbtypes.FoundationDBStatusProcessInfo, status *fdbtypes.FoundationDBClusterStatus, processNumber int, processCount int, processGroupStatus *fdbtypes.ProcessGroupStatus) error {
+func CheckAndSetProcessStatus(r *FoundationDBClusterReconciler, cluster *fdbtypes.FoundationDBCluster, instance FdbInstance, processMap map[string][]fdbtypes.FoundationDBStatusProcessInfo, processNumber int, processCount int, processGroupStatus *fdbtypes.ProcessGroupStatus) error {
 	instanceID := instance.GetInstanceID()
 
 	if processCount > 1 {
@@ -433,21 +417,34 @@ func CheckAndSetProcessStatus(r *FoundationDBClusterReconciler, cluster *fdbtype
 		return nil
 	}
 
-	podClient, err := r.getPodClient(cluster, instance)
-	correct := false
-	if err != nil {
-		log.Error(err, "Error getting pod client", "instance", instance.Metadata.Name)
-	} else {
-		for _, process := range processStatus {
-			commandLine, err := GetStartCommand(cluster, instance, podClient, processNumber, processCount)
-			if err != nil {
-				return err
-			}
-			correct = commandLine == process.CommandLine && (process.Version == cluster.Spec.Version || process.Version == fmt.Sprintf("%s-PRERELEASE", cluster.Spec.Version))
+	podClient, message := r.getPodClient(cluster, instance)
+	if podClient == nil {
+		log.Info("Unable to build pod client", "namespace", cluster.Namespace, "cluster", cluster.Name, "instance", instance.Metadata.Name, "message", message)
+		return nil
+	}
 
-			if !correct {
-				log.Info("IncorrectProcess", "expected", commandLine, "got", process.CommandLine)
-			}
+	correct := false
+	for _, process := range processStatus {
+		commandLine, err := GetStartCommand(cluster, instance, podClient, processNumber, processCount)
+		if err != nil {
+			return err
+		}
+
+		correct = commandLine == process.CommandLine
+
+		settings := cluster.GetProcessSettings(instance.GetProcessClass())
+		versionMatch := true
+		// if we allow to override the tag we can't compare the versions here
+		if !settings.GetAllowTagOverride() {
+			versionMatch = process.Version == cluster.Spec.Version || process.Version == fmt.Sprintf("%s-PRERELEASE", cluster.Spec.Version)
+		}
+	}
+
+		// If the `EmptyMonitorConf` is set, the commandline is by definition wrong since there should be no running processes.
+		correct = correct && versionMatch && !cluster.Spec.Buggify.EmptyMonitorConf
+
+		if !correct {
+			log.Info("IncorrectProcess", "namespace", cluster.Namespace, "cluster", cluster.Name, "expected", commandLine, "got", process.CommandLine, "expectedVersion", cluster.Spec.Version, "version", process.Version, "processGroupID", instanceID)
 		}
 	}
 
@@ -459,15 +456,15 @@ func CheckAndSetProcessStatus(r *FoundationDBClusterReconciler, cluster *fdbtype
 func validateInstances(r *FoundationDBClusterReconciler, context ctx.Context, cluster *fdbtypes.FoundationDBCluster, status *fdbtypes.FoundationDBClusterStatus, processMap map[string][]fdbtypes.FoundationDBStatusProcessInfo, instances []FdbInstance, configMap *corev1.ConfigMap) ([]*fdbtypes.ProcessGroupStatus, error) {
 	processGroups := status.ProcessGroups
 	processGroupMap := make(map[string]*fdbtypes.ProcessGroupStatus, len(processGroups))
+	// TODO (johscheuer): make use of internal.None once the other PR is merged
+	processGroupsWithoutExclusion := make(map[string]struct{}, len(cluster.Spec.InstancesToRemoveWithoutExclusion))
+
+	for _, processGroupID := range cluster.Spec.InstancesToRemoveWithoutExclusion {
+		processGroupsWithoutExclusion[processGroupID] = struct{}{}
+	}
 
 	for _, processGroup := range processGroups {
 		processGroupMap[processGroup.ProcessGroupID] = processGroup
-	}
-
-	// TODO (johscheuer): should be process specific #377
-	configMapHash, err := GetDynamicConfHash(configMap)
-	if err != nil {
-		return processGroups, err
 	}
 
 	for _, instance := range instances {
@@ -481,13 +478,7 @@ func validateInstances(r *FoundationDBClusterReconciler, context ctx.Context, cl
 			processGroupMap[instanceID] = processGroupStatus
 		}
 
-		processGroupStatus.Addresses = append(processGroupStatus.Addresses, instance.GetPublicIPs()...)
-
-		if r.PodIPProvider != nil && instance.Pod != nil {
-			processGroupStatus.Addresses = append(processGroupStatus.Addresses, r.PodIPProvider(instance.Pod))
-		}
-
-		processGroupStatus.Addresses = cleanAddressList((processGroupStatus.Addresses))
+		processGroupStatus.AddAddresses(instance.GetPublicIPs())
 
 		processCount := 1
 
@@ -503,6 +494,7 @@ func validateInstances(r *FoundationDBClusterReconciler, context ctx.Context, cl
 
 		// Even the instance will be removed we need to keep the config around.
 		// Set the processCount for the instance specific storage servers per pod
+		var err error
 		if processClass == fdbtypes.ProcessClassStorage {
 			processCount, err = getStorageServersPerPodForInstance(&instance)
 			if err != nil {
@@ -514,15 +506,28 @@ func validateInstances(r *FoundationDBClusterReconciler, context ctx.Context, cl
 
 		if isBeingRemoved {
 			processGroupStatus.Remove = true
+			// Check if we should skip exclusion for the process group
+			_, ok := processGroupsWithoutExclusion[processGroupStatus.ProcessGroupID]
+			processGroupStatus.ExclusionSkipped = ok
 			continue
 		}
 
 		// In theory we could also support multiple processes per pod for different classes
 		for i := 1; i <= processCount; i++ {
-			err := CheckAndSetProcessStatus(r, cluster, instance, processMap, status, i, processCount, processGroupStatus)
+			err := CheckAndSetProcessStatus(r, cluster, instance, processMap, i, processCount, processGroupStatus)
 			if err != nil {
 				return processGroups, err
 			}
+		}
+
+		serverPerPod, err := getStorageServersPerPodForInstance(&instance)
+		if err != nil {
+			return processGroups, err
+		}
+
+		configMapHash, err := getDynamicConfHash(configMap, instance.GetProcessClass(), serverPerPod)
+		if err != nil {
+			return processGroups, err
 		}
 
 		needsSidecarConfInConfigMap, err := validateInstance(r, context, cluster, instance, configMapHash, processGroupStatus)
@@ -571,8 +576,7 @@ func validateInstance(r *FoundationDBClusterReconciler, context ctx.Context, clu
 
 	processGroupStatus.UpdateCondition(fdbtypes.IncorrectPodSpec, incorrectPod, cluster.Status.ProcessGroups, instanceID)
 
-	incorrectConfigMap := instance.Metadata.Annotations[LastConfigMapKey] != configMapHash
-
+	incorrectConfigMap := instance.Metadata.Annotations[fdbtypes.LastConfigMapKey] != configMapHash
 	processGroupStatus.UpdateCondition(fdbtypes.IncorrectConfigMap, incorrectConfigMap, cluster.Status.ProcessGroups, instanceID)
 
 	pvcs := &corev1.PersistentVolumeClaimList{}
@@ -595,8 +599,7 @@ func validateInstance(r *FoundationDBClusterReconciler, context ctx.Context, clu
 	var needsSidecarConfInConfigMap bool
 	for _, container := range instance.Pod.Spec.Containers {
 		if container.Name == "foundationdb" {
-			image := strings.Split(container.Image, ":")
-			version, err := fdbtypes.ParseFdbVersion(image[len(image)-1])
+			version, err := fdbtypes.ParseFdbVersion(cluster.Status.RunningVersion)
 			if err != nil {
 				return false, err
 			}
@@ -611,6 +614,27 @@ func validateInstance(r *FoundationDBClusterReconciler, context ctx.Context, clu
 		if !container.Ready {
 			failing = true
 			break
+		}
+	}
+
+	// Fix for https://github.com/kubernetes/kubernetes/issues/92067
+	// This will delete the Pod that is stuck in the "NodeAffinity"
+	// at a later stage the Pod will be recreated by the operator.
+	if instance.Pod.Status.Phase == corev1.PodFailed {
+		failing = true
+
+		// Only recreate the Pod if it is already 5 minutes up (just to prevent to recreate the Pod multiple times
+		// and give the cluster some time to get the kubelet up
+		if instance.Pod.Status.Reason == "NodeAffinity" && instance.Pod.CreationTimestamp.Add(5*time.Minute).Before(time.Now()) {
+			log.Info("Delete Pod that is stuck in NodeAffinity",
+				"namespace", cluster.Namespace,
+				"cluster", cluster.Name,
+				"processGroupID", instanceID)
+
+			err = r.PodLifecycleManager.DeleteInstance(r, context, instance)
+			if err != nil {
+				return needsSidecarConfInConfigMap, err
+			}
 		}
 	}
 
@@ -638,17 +662,4 @@ func removeDuplicateConditions(status fdbtypes.FoundationDBClusterStatus) {
 		}
 		processGroupStatus.ProcessGroupConditions = conditions
 	}
-}
-
-// This method removes duplicates and empty strings from a list of addresses.
-func cleanAddressList(addresses []string) []string {
-	result := make([]string, 0, len(addresses))
-	resultMap := make(map[string]bool)
-	for _, value := range addresses {
-		if value != "" && !resultMap[value] {
-			result = append(result, value)
-			resultMap[value] = true
-		}
-	}
-	return result
 }

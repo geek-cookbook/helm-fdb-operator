@@ -23,7 +23,8 @@ package controllers
 import (
 	ctx "context"
 	"fmt"
-	"time"
+
+	corev1 "k8s.io/api/core/v1"
 
 	fdbtypes "github.com/FoundationDB/fdb-kubernetes-operator/api/v1beta1"
 )
@@ -32,21 +33,20 @@ import (
 type AddProcessGroups struct{}
 
 // Reconcile runs the reconciler's work.
-func (a AddProcessGroups) Reconcile(r *FoundationDBClusterReconciler, context ctx.Context, cluster *fdbtypes.FoundationDBCluster) (bool, error) {
+func (a AddProcessGroups) Reconcile(r *FoundationDBClusterReconciler, context ctx.Context, cluster *fdbtypes.FoundationDBCluster) *Requeue {
 	desiredCountStruct, err := cluster.GetProcessCountsWithDefaults()
 	if err != nil {
-		return false, err
+		return &Requeue{Error: err}
 	}
 	desiredCounts := desiredCountStruct.Map()
 
 	processCounts := make(map[fdbtypes.ProcessClass]int)
 	processGroupIDs := make(map[fdbtypes.ProcessClass]map[int]bool)
 	for _, processGroup := range cluster.Status.ProcessGroups {
-
 		processGroupID := processGroup.ProcessGroupID
 		_, num, err := ParseInstanceID(processGroupID)
 		if err != nil {
-			return false, err
+			return &Requeue{Error: err}
 		}
 
 		class := processGroup.ProcessClass
@@ -71,7 +71,7 @@ func (a AddProcessGroups) Reconcile(r *FoundationDBClusterReconciler, context ct
 		if newCount <= 0 {
 			continue
 		}
-		r.Recorder.Event(cluster, "Normal", "AddingProcesses", fmt.Sprintf("Adding %d %s processes", newCount, processClass))
+		r.Recorder.Event(cluster, corev1.EventTypeNormal, "AddingProcesses", fmt.Sprintf("Adding %d %s processes", newCount, processClass))
 		idNum := 1
 
 		if processGroupIDs[processClass] == nil {
@@ -99,15 +99,9 @@ func (a AddProcessGroups) Reconcile(r *FoundationDBClusterReconciler, context ct
 	if hasNewProcessGroups {
 		err = r.Status().Update(context, cluster)
 		if err != nil {
-			return false, err
+			return &Requeue{Error: err}
 		}
 	}
 
-	return true, nil
-}
-
-// RequeueAfter returns the delay before we should run the reconciliation
-// again.
-func (a AddProcessGroups) RequeueAfter() time.Duration {
-	return 0
+	return nil
 }

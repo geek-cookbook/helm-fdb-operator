@@ -29,6 +29,8 @@ import (
 	"strings"
 	"time"
 
+	fdbtypes "github.com/FoundationDB/fdb-kubernetes-operator/api/v1beta1"
+
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/runtime"
 
@@ -53,11 +55,15 @@ type MockClient struct {
 
 	// ipCounter provides monotonically incrementing IP addresses.
 	ipCounter int
+
+	// stuckTerminatingObjects tracks which objects should be stuck in terminating.
+	stuckTerminatingObjects map[string]map[string]bool
 }
 
 // Clear erases any mock data.
 func (client *MockClient) Clear() {
 	client.data = make(map[string]map[string]map[string]interface{})
+	client.stuckTerminatingObjects = nil
 }
 
 // Scheme returns the runtime Scheme
@@ -65,7 +71,7 @@ func (client *MockClient) Scheme() *runtime.Scheme {
 	return nil
 }
 
-// RESTMapper retruns the RESTMapper
+// RESTMapper returns the RESTMapper
 func (client *MockClient) RESTMapper() meta.RESTMapper {
 	return nil
 }
@@ -158,7 +164,7 @@ func lookupJSONString(genericData map[string]interface{}, path ...string) (strin
 	}
 	stringResult, isString := result.(string)
 	if !isString {
-		return "", fmt.Errorf("Type error for key %v", path)
+		return "", fmt.Errorf("type error for key %v", path)
 	}
 	return stringResult, nil
 }
@@ -293,6 +299,8 @@ func (client *MockClient) checkPresence(kindKey string, objectKey string) error 
 
 // Create creates a new object
 func (client *MockClient) Create(context ctx.Context, object ctrlClient.Object, options ...ctrlClient.CreateOption) error {
+	object.SetCreationTimestamp(metav1.Time{Time: time.Now()})
+
 	jsonData, err := json.Marshal(object)
 	if err != nil {
 		return err
@@ -335,6 +343,11 @@ func (client *MockClient) Create(context ctx.Context, object ctrlClient.Object, 
 			if err != nil {
 				return err
 			}
+		}
+	} else if kindKey == "/v1/Pod" {
+		err = setJSONValue(genericObject, []string{"status", "podIP"}, generatePodIP(object.GetLabels()))
+		if err != nil {
+			return err
 		}
 	}
 
@@ -468,7 +481,11 @@ func (client *MockClient) Delete(context ctx.Context, object ctrlClient.Object, 
 		return err
 	}
 
-	delete(client.data[kindKey], objectKey)
+	stuckTerminating := client.stuckTerminatingObjects != nil && client.stuckTerminatingObjects[kindKey] != nil && client.stuckTerminatingObjects[kindKey][objectKey]
+	if !stuckTerminating {
+		delete(client.data[kindKey], objectKey)
+	}
+
 	return nil
 }
 
@@ -543,6 +560,42 @@ func (client *MockClient) DeleteAllOf(context ctx.Context, object ctrlClient.Obj
 	return fmt.Errorf("Not implemented")
 }
 
+// MockStuckTermination sets a flag determining whether an object should get stuck in terminating when it is deleted.
+func (client *MockClient) MockStuckTermination(object ctrlClient.Object, terminating bool) error {
+	kindKey, err := buildKindKey(object)
+	if err != nil {
+		return err
+	}
+
+	if terminating {
+		object.SetDeletionTimestamp(&metav1.Time{Time: time.Now()})
+	} else {
+		object.SetDeletionTimestamp(nil)
+	}
+
+	// We have to update the state in the mock client
+	err = client.Update(context.Background(), object)
+	if err != nil {
+		return err
+	}
+
+	objectKey, err := buildRuntimeObjectKey(object)
+	if err != nil {
+		return err
+	}
+
+	if client.stuckTerminatingObjects == nil {
+		client.stuckTerminatingObjects = make(map[string]map[string]bool)
+	}
+
+	if client.stuckTerminatingObjects[kindKey] == nil {
+		client.stuckTerminatingObjects[kindKey] = make(map[string]bool)
+	}
+
+	client.stuckTerminatingObjects[kindKey][objectKey] = terminating
+	return nil
+}
+
 // MockStatusClient wraps a client to provide specialized operations for
 // updating status.
 type MockStatusClient struct {
@@ -591,7 +644,7 @@ func (client MockStatusClient) Update(context ctx.Context, object ctrlClient.Obj
 // Patch patches an object's status.
 // This is not yet implemented.
 func (client MockStatusClient) Patch(context ctx.Context, object ctrlClient.Object, patch ctrlClient.Patch, options ...ctrlClient.PatchOption) error {
-	return fmt.Errorf("Not implemented")
+	return fmt.Errorf("not implemented")
 }
 
 // Status returns a writer for updating status.
@@ -670,4 +723,48 @@ func (client *MockClient) AnnotatedEventf(object runtime.Object, annotations map
 	event := buildEvent(object, eventType, reason, fmt.Sprintf(messageFormat, args...))
 	event.ObjectMeta.Annotations = annotations
 	client.createEvent(event)
+}
+
+// SetPodIntoFailed sets a Pod into a failed status with the given reason
+func (client *MockClient) SetPodIntoFailed(context ctx.Context, object ctrlClient.Object, reason string) error {
+	data, err := json.Marshal(object)
+	if err != nil {
+		return err
+	}
+
+	pod := &corev1.Pod{}
+	err = json.Unmarshal(data, pod)
+	if err != nil {
+		return err
+	}
+
+	pod.Status.Phase = corev1.PodFailed
+	pod.Status.Reason = reason
+	pod.CreationTimestamp = metav1.Time{Time: time.Now().Add(-30 * time.Minute)}
+
+	return client.Update(context, pod)
+}
+
+// RemovePodIP sets the IP address of the Pod to an empty string
+func (client *MockClient) RemovePodIP(pod *corev1.Pod) error {
+	pod.Status.PodIP = ""
+
+	return client.Update(ctx.TODO(), pod)
+}
+
+// generatePodIP generates a mock IP for Pods
+func generatePodIP(labels map[string]string) string {
+	instanceID, ok := labels[fdbtypes.FDBInstanceIDLabel]
+	if !ok {
+		return ""
+	}
+
+	components := strings.Split(instanceID, "-")
+	for index, class := range fdbtypes.ProcessClasses {
+		if string(class) == components[len(components)-2] {
+			return fmt.Sprintf("1.1.%d.%s", index, components[len(components)-1])
+		}
+	}
+
+	return "0.0.0.0"
 }

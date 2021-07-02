@@ -35,7 +35,7 @@ var _ = Describe("add_services", func() {
 
 	var cluster *fdbtypes.FoundationDBCluster
 	var err error
-	var shouldContinue bool
+	var requeue *Requeue
 	var initialServices *corev1.ServiceList
 	var newServices *corev1.ServiceList
 
@@ -63,7 +63,7 @@ var _ = Describe("add_services", func() {
 	})
 
 	JustBeforeEach(func() {
-		shouldContinue, err = AddServices{}.Reconcile(clusterReconciler, context.TODO(), cluster)
+		requeue = AddServices{}.Reconcile(clusterReconciler, context.TODO(), cluster)
 		Expect(err).NotTo(HaveOccurred())
 		_, err = reloadCluster(cluster)
 		Expect(err).NotTo(HaveOccurred())
@@ -78,7 +78,7 @@ var _ = Describe("add_services", func() {
 
 	Context("with a reconciled cluster", func() {
 		It("should not requeue", func() {
-			Expect(shouldContinue).To(BeTrue())
+			Expect(requeue).To(BeNil())
 		})
 
 		It("should not create any services", func() {
@@ -92,15 +92,15 @@ var _ = Describe("add_services", func() {
 		})
 
 		It("should not requeue", func() {
-			Expect(shouldContinue).To(BeTrue())
+			Expect(requeue).To(BeNil())
 		})
 
 		It("should create an extra service", func() {
 			Expect(newServices.Items).To(HaveLen(len(initialServices.Items) + 1))
 			lastService := newServices.Items[len(newServices.Items)-1]
 			Expect(lastService.Name).To(Equal("operator-test-1-storage-9"))
-			Expect(lastService.Labels[FDBInstanceIDLabel]).To(Equal("storage-9"))
-			Expect(lastService.Labels[FDBProcessClassLabel]).To(Equal("storage"))
+			Expect(lastService.Labels[fdbtypes.FDBInstanceIDLabel]).To(Equal("storage-9"))
+			Expect(lastService.Labels[fdbtypes.FDBProcessClassLabel]).To(Equal("storage"))
 			Expect(lastService.Spec.ClusterIP).NotTo(Equal("None"))
 			Expect(lastService.OwnerReferences).To(Equal(buildOwnerReference(cluster.TypeMeta, cluster.ObjectMeta)))
 		})
@@ -112,7 +112,7 @@ var _ = Describe("add_services", func() {
 			})
 
 			It("should not requeue", func() {
-				Expect(shouldContinue).To(BeTrue())
+				Expect(requeue).To(BeNil())
 			})
 
 			It("should not create any services", func() {
@@ -126,7 +126,7 @@ var _ = Describe("add_services", func() {
 			})
 
 			It("should not requeue", func() {
-				Expect(shouldContinue).To(BeTrue())
+				Expect(requeue).To(BeNil())
 			})
 
 			It("should not create any pods", func() {
@@ -145,7 +145,7 @@ var _ = Describe("add_services", func() {
 		})
 
 		It("should not requeue", func() {
-			Expect(shouldContinue).To(BeTrue())
+			Expect(requeue).To(BeNil())
 		})
 
 		It("should create a headless service", func() {
@@ -154,7 +154,7 @@ var _ = Describe("add_services", func() {
 			firstService := newServices.Items[0]
 
 			Expect(firstService.Name).To(Equal("operator-test-1"))
-			Expect(firstService.Labels[FDBInstanceIDLabel]).To(Equal(""))
+			Expect(firstService.Labels[fdbtypes.FDBInstanceIDLabel]).To(Equal(""))
 			Expect(firstService.Spec.ClusterIP).To(Equal("None"))
 		})
 
@@ -165,7 +165,7 @@ var _ = Describe("add_services", func() {
 			})
 
 			It("should not requeue", func() {
-				Expect(shouldContinue).To(BeTrue())
+				Expect(requeue).To(BeNil())
 			})
 
 			It("should not create any services", func() {

@@ -39,7 +39,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	fdbtypes "github.com/FoundationDB/fdb-kubernetes-operator/api/v1beta1"
-	"github.com/FoundationDB/fdb-kubernetes-operator/controllers"
 )
 
 func newExecCmd(streams genericclioptions.IOStreams) *cobra.Command {
@@ -107,11 +106,11 @@ func newExecCmd(streams genericclioptions.IOStreams) *cobra.Command {
 func buildCommand(kubeClient client.Client, clusterName string, context string, namespace string, commandArgs []string) (exec.Cmd, error) {
 	pods := &corev1.PodList{}
 
-	clusterRequirement, err := labels.NewRequirement(controllers.FDBClusterLabel, selection.Equals, []string{clusterName})
+	clusterRequirement, err := labels.NewRequirement(fdbtypes.FDBClusterLabel, selection.Equals, []string{clusterName})
 	if err != nil {
 		return exec.Cmd{}, nil
 	}
-	processClassRequirement, err := labels.NewRequirement(controllers.FDBProcessClassLabel, selection.Exists, nil)
+	processClassRequirement, err := labels.NewRequirement(fdbtypes.FDBProcessClassLabel, selection.Exists, nil)
 	if err != nil {
 		return exec.Cmd{}, nil
 	}
@@ -125,7 +124,7 @@ func buildCommand(kubeClient client.Client, clusterName string, context string, 
 		return exec.Cmd{}, err
 	}
 	if len(pods.Items) == 0 {
-		return exec.Cmd{}, fmt.Errorf("No usable pods found for cluster %s", clusterName)
+		return exec.Cmd{}, fmt.Errorf("no usable pods found for cluster %s", clusterName)
 	}
 	kubectlPath, err := exec.LookPath("kubectl")
 	if err != nil {

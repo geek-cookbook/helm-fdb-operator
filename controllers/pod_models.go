@@ -22,10 +22,11 @@ package controllers
 
 import (
 	"fmt"
-	"reflect"
 	"regexp"
 	"strconv"
 	"strings"
+
+	"github.com/FoundationDB/fdb-kubernetes-operator/internal"
 
 	fdbtypes "github.com/FoundationDB/fdb-kubernetes-operator/api/v1beta1"
 	appsv1 "k8s.io/api/apps/v1"
@@ -127,7 +128,7 @@ func GetPod(cluster *fdbtypes.FoundationDBCluster, processClass fdbtypes.Process
 	}, nil
 }
 
-func getImage(imageName, curImage, defaultImage, versionString string) (string, error) {
+func getImage(imageName, curImage, defaultImage, versionString string, allowOverride bool) (string, error) {
 	var resImage string
 	if imageName != "" {
 		resImage = imageName
@@ -141,9 +142,13 @@ func getImage(imageName, curImage, defaultImage, versionString string) (string, 
 		resImage = defaultImage
 	}
 
-	// If the specified image contains a tag return an error
 	res := strings.Split(resImage, ":")
 	if len(res) > 1 {
+		if allowOverride {
+			return resImage, nil
+		}
+
+		// If the specified image contains a tag and allowOverride is false return an error
 		return "", fmt.Errorf("image should not contain a tag but contains the tag \"%s\", please remove the tag", res[1])
 	}
 
@@ -192,7 +197,7 @@ func GetPodSpec(cluster *fdbtypes.FoundationDBCluster, processClass fdbtypes.Pro
 		versionString = cluster.Spec.Version
 	}
 
-	image, err := getImage(cluster.Spec.MainContainer.ImageName, mainContainer.Image, "foundationdb/foundationdb", versionString)
+	image, err := getImage(cluster.Spec.MainContainer.ImageName, mainContainer.Image, "foundationdb/foundationdb", versionString, processSettings.GetAllowTagOverride())
 	if err != nil {
 		return nil, err
 	}
@@ -216,12 +221,18 @@ func GetPodSpec(cluster *fdbtypes.FoundationDBCluster, processClass fdbtypes.Pro
 	}
 
 	mainContainer.Command = []string{"sh", "-c"}
-	mainContainer.Args = []string{
-		"fdbmonitor --conffile /var/dynamic-conf/fdbmonitor.conf" +
-			" --lockfile /var/dynamic-conf/fdbmonitor.lockfile" +
-			" --loggroup " + logGroup +
-			" >> /var/log/fdb-trace-logs/fdbmonitor-$(date '+%Y-%m-%d').log 2>&1",
+
+	args := "fdbmonitor --conffile /var/dynamic-conf/fdbmonitor.conf" +
+		" --lockfile /var/dynamic-conf/fdbmonitor.lockfile" +
+		" --loggroup " + logGroup +
+		" >> /var/log/fdb-trace-logs/fdbmonitor-$(date '+%Y-%m-%d').log 2>&1"
+
+	for _, crashLoopInstanceID := range cluster.Spec.Buggify.CrashLoop {
+		if instanceID == crashLoopInstanceID || crashLoopInstanceID == "*" {
+			args = "crash-loop"
+		}
 	}
+	mainContainer.Args = []string{args}
 
 	mainContainer.VolumeMounts = append(mainContainer.VolumeMounts,
 		corev1.VolumeMount{Name: "data", MountPath: "/var/fdb/data"},
@@ -233,18 +244,21 @@ func GetPodSpec(cluster *fdbtypes.FoundationDBCluster, processClass fdbtypes.Pro
 	if mainContainer.SecurityContext == nil {
 		mainContainer.SecurityContext = &corev1.SecurityContext{}
 	}
-	mainContainer.SecurityContext.ReadOnlyRootFilesystem = &readOnlyRootFilesystem
+
+	if mainContainer.SecurityContext.ReadOnlyRootFilesystem == nil {
+		mainContainer.SecurityContext.ReadOnlyRootFilesystem = &readOnlyRootFilesystem
+	}
 
 	customizeContainer(mainContainer, cluster.Spec.MainContainer)
 
 	customizeContainer(initContainer, cluster.Spec.SidecarContainer)
-	err = configureSidecarContainerForCluster(cluster, initContainer, true, instanceID)
+	err = configureSidecarContainerForCluster(cluster, initContainer, true, instanceID, processSettings.GetAllowTagOverride())
 	if err != nil {
 		return nil, err
 	}
 
 	customizeContainer(sidecarContainer, cluster.Spec.SidecarContainer)
-	err = configureSidecarContainerForCluster(cluster, sidecarContainer, false, instanceID)
+	err = configureSidecarContainerForCluster(cluster, sidecarContainer, false, instanceID, processSettings.GetAllowTagOverride())
 	if err != nil {
 		return nil, err
 	}
@@ -275,7 +289,7 @@ func GetPodSpec(cluster *fdbtypes.FoundationDBCluster, processClass fdbtypes.Pro
 
 	configMapItems := []corev1.KeyToPath{
 		{Key: monitorConf, Path: "fdbmonitor.conf"},
-		{Key: "cluster-file", Path: "fdb.cluster"},
+		{Key: clusterFileKey, Path: "fdb.cluster"},
 	}
 
 	if useCustomCAs {
@@ -319,8 +333,8 @@ func GetPodSpec(cluster *fdbtypes.FoundationDBCluster, processClass fdbtypes.Pro
 						PodAffinityTerm: corev1.PodAffinityTerm{
 							TopologyKey: faultDomainKey,
 							LabelSelector: &metav1.LabelSelector{MatchLabels: map[string]string{
-								FDBClusterLabel:      cluster.ObjectMeta.Name,
-								FDBProcessClassLabel: string(processClass),
+								fdbtypes.FDBClusterLabel:      cluster.ObjectMeta.Name,
+								fdbtypes.FDBProcessClassLabel: string(processClass),
 							}},
 						},
 					},
@@ -342,7 +356,7 @@ func GetPodSpec(cluster *fdbtypes.FoundationDBCluster, processClass fdbtypes.Pro
 			}
 			affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms = append(affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms, corev1.NodeSelectorTerm{
 				MatchExpressions: []corev1.NodeSelectorRequirement{{
-					Key: NodeSelectorNoScheduleLabel, Operator: corev1.NodeSelectorOpIn, Values: []string{"true"},
+					Key: fdbtypes.NodeSelectorNoScheduleLabel, Operator: corev1.NodeSelectorOpIn, Values: []string{"true"},
 				}},
 			})
 		}
@@ -350,6 +364,7 @@ func GetPodSpec(cluster *fdbtypes.FoundationDBCluster, processClass fdbtypes.Pro
 
 	replaceContainers(podSpec.InitContainers, initContainer)
 	replaceContainers(podSpec.Containers, mainContainer, sidecarContainer)
+
 	podSpec.Volumes = append(podSpec.Volumes, volumes...)
 	podSpec.Affinity = affinity
 
@@ -365,24 +380,24 @@ func GetPodSpec(cluster *fdbtypes.FoundationDBCluster, processClass fdbtypes.Pro
 
 // configureSidecarContainerForCluster sets up a sidecar container for a sidecar
 // in the FDB cluster.
-func configureSidecarContainerForCluster(cluster *fdbtypes.FoundationDBCluster, container *corev1.Container, initMode bool, instanceID string) error {
+func configureSidecarContainerForCluster(cluster *fdbtypes.FoundationDBCluster, container *corev1.Container, initMode bool, instanceID string, allowOverride bool) error {
 	versionString := cluster.Status.RunningVersion
 	if versionString == "" {
 		versionString = cluster.Spec.Version
 	}
 
-	return configureSidecarContainer(container, initMode, instanceID, versionString, cluster)
+	return configureSidecarContainer(container, initMode, instanceID, versionString, cluster, allowOverride)
 }
 
 // configureSidecarContainerForBackup sets up a sidecar container for the init
 // container for a backup process.
 func configureSidecarContainerForBackup(backup *fdbtypes.FoundationDBBackup, container *corev1.Container) error {
-	return configureSidecarContainer(container, true, "", backup.Spec.Version, nil)
+	return configureSidecarContainer(container, true, "", backup.Spec.Version, nil, backup.Spec.GetAllowTagOverride())
 }
 
 // configureSidecarContainer sets up a foundationdb-kubernetes-sidecar
 // container.
-func configureSidecarContainer(container *corev1.Container, initMode bool, instanceID string, versionString string, optionalCluster *fdbtypes.FoundationDBCluster) error {
+func configureSidecarContainer(container *corev1.Container, initMode bool, instanceID string, versionString string, optionalCluster *fdbtypes.FoundationDBCluster, allowOverride bool) error {
 	version, err := fdbtypes.ParseFdbVersion(versionString)
 	if err != nil {
 		return err
@@ -444,7 +459,7 @@ func configureSidecarContainer(container *corev1.Container, initMode bool, insta
 
 		var publicIPKey string
 		if usePublicIPFromService {
-			publicIPKey = fmt.Sprintf("metadata.annotations['%s']", PublicIPAnnotation)
+			publicIPKey = fmt.Sprintf("metadata.annotations['%s']", fdbtypes.PublicIPAnnotation)
 		} else {
 			publicIPKey = "status.podIP"
 		}
@@ -505,6 +520,21 @@ func configureSidecarContainer(container *corev1.Container, initMode bool, insta
 		}
 
 		sidecarEnv = append(sidecarEnv, corev1.EnvVar{Name: "FDB_INSTANCE_ID", Value: instanceID})
+
+		if !initMode && cluster.Spec.SidecarContainer.EnableLivenessProbe && container.LivenessProbe == nil {
+			// We can't use a HTTP handler here since the server
+			// requires a client certificate
+			container.LivenessProbe = &corev1.Probe{
+				Handler: corev1.Handler{
+					TCPSocket: &corev1.TCPSocketAction{
+						Port: intstr.IntOrString{IntVal: 8080},
+					},
+				},
+				TimeoutSeconds:   1,
+				PeriodSeconds:    30,
+				FailureThreshold: 5,
+			}
+		}
 	}
 
 	if version.PrefersCommandLineArgumentsInSidecar() && initMode {
@@ -532,7 +562,7 @@ func configureSidecarContainer(container *corev1.Container, initMode bool, insta
 		corev1.VolumeMount{Name: "dynamic-conf", MountPath: "/var/output-files"},
 	)
 
-	image, err := getImage(overrides.ImageName, container.Image, "foundationdb/foundationdb-kubernetes-sidecar", sidecarVersion)
+	image, err := getImage(overrides.ImageName, container.Image, "foundationdb/foundationdb-kubernetes-sidecar", sidecarVersion, allowOverride)
 	if err != nil {
 		return err
 	}
@@ -630,7 +660,7 @@ func GetPvc(cluster *fdbtypes.FoundationDBCluster, processClass fdbtypes.Process
 	if pvc.ObjectMeta.Annotations == nil {
 		pvc.ObjectMeta.Annotations = make(map[string]string, 1)
 	}
-	pvc.ObjectMeta.Annotations[LastSpecKey] = specHash
+	pvc.ObjectMeta.Annotations[fdbtypes.LastSpecKey] = specHash
 
 	return pvc, nil
 }
@@ -668,8 +698,7 @@ func extendEnv(container *corev1.Container, env ...corev1.EnvVar) {
 func customizeContainer(container *corev1.Container, overrides fdbtypes.ContainerOverrides) {
 	envOverrides := make(map[string]bool)
 
-	fullEnv := []corev1.EnvVar{}
-
+	fullEnv := make([]corev1.EnvVar, 0)
 	for _, envVar := range overrides.Env {
 		fullEnv = append(fullEnv, *envVar.DeepCopy())
 		envOverrides[envVar.Name] = true
@@ -718,7 +747,7 @@ func GetBackupDeployment(backup *fdbtypes.FoundationDBBackup) (*appsv1.Deploymen
 			deployment.ObjectMeta.Annotations[key] = value
 		}
 	}
-	deployment.ObjectMeta.Labels[BackupDeploymentLabel] = string(backup.ObjectMeta.UID)
+	deployment.ObjectMeta.Labels[fdbtypes.BackupDeploymentLabel] = string(backup.ObjectMeta.UID)
 
 	var podTemplate *corev1.PodTemplateSpec
 	if backup.Spec.PodTemplateSpec != nil {
@@ -751,7 +780,7 @@ func GetBackupDeployment(backup *fdbtypes.FoundationDBBackup) (*appsv1.Deploymen
 		podTemplate.Spec.Containers = containers
 	}
 
-	image, err := getImage(mainContainer.Image, mainContainer.Image, "foundationdb/foundationdb", backup.Spec.Version)
+	image, err := getImage(mainContainer.Image, mainContainer.Image, "foundationdb/foundationdb", backup.Spec.Version, backup.Spec.GetAllowTagOverride())
 	if err != nil {
 		return nil, err
 	}
@@ -760,7 +789,7 @@ func GetBackupDeployment(backup *fdbtypes.FoundationDBBackup) (*appsv1.Deploymen
 	args := []string{"--log", "--logdir", "/var/log/fdb-trace-logs"}
 
 	if len(backup.Spec.CustomParameters) > 0 {
-		err := ValidateCustomParameters(backup.Spec.CustomParameters)
+		err := internal.ValidateCustomParameters(backup.Spec.CustomParameters)
 		if err != nil {
 			return nil, err
 		}
@@ -820,7 +849,7 @@ func GetBackupDeployment(backup *fdbtypes.FoundationDBBackup) (*appsv1.Deploymen
 			VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{
 				LocalObjectReference: corev1.LocalObjectReference{Name: fmt.Sprintf("%s-config", backup.Spec.ClusterName)},
 				Items: []corev1.KeyToPath{
-					{Key: "cluster-file", Path: "fdb.cluster"},
+					{Key: clusterFileKey, Path: "fdb.cluster"},
 				},
 			}},
 		},
@@ -833,421 +862,9 @@ func GetBackupDeployment(backup *fdbtypes.FoundationDBBackup) (*appsv1.Deploymen
 		return nil, err
 	}
 
-	deployment.ObjectMeta.Annotations[LastSpecKey] = specHash
+	deployment.ObjectMeta.Annotations[fdbtypes.LastSpecKey] = specHash
 
 	return deployment, nil
-}
-
-// ensureContainerPresent looks for a container by name from a list, and adds
-// an empty container with that name if none is present.
-func ensureContainerPresent(containers []corev1.Container, name string, insertIndex int) ([]corev1.Container, int) {
-	for index, container := range containers {
-		if container.Name == name {
-			return containers, index
-		}
-	}
-
-	if insertIndex < 0 || insertIndex >= len(containers) {
-		containers = append(containers, corev1.Container{Name: name})
-		return containers, len(containers) - 1
-	}
-	containerCount := 1 + len(containers)
-	newContainers := make([]corev1.Container, 0, containerCount)
-	for indexToCopy := 0; indexToCopy < len(containers); indexToCopy++ {
-		if indexToCopy == insertIndex {
-			newContainers = append(newContainers, corev1.Container{
-				Name: name,
-			})
-		}
-		newContainers = append(newContainers, containers[indexToCopy])
-	}
-
-	return newContainers, insertIndex
-}
-
-// ValidateCustomParameters ensures that no duplicate values are set and that no
-// protected/forbidden parameters are set. Theoretically we could also check if FDB
-// supports the given parameter.
-func ValidateCustomParameters(customParameters []string) error {
-	protectedParameters := map[string]bool{"datadir": true}
-	parameters := make(map[string]bool)
-	violations := make([]string, 0)
-
-	for _, parameter := range customParameters {
-		parameterName := strings.Split(parameter, "=")[0]
-		parameterName = strings.TrimSpace(parameterName)
-
-		if _, ok := parameters[parameterName]; !ok {
-			parameters[parameterName] = true
-		} else {
-			violations = append(violations, fmt.Sprintf("found duplicated customParameter: %v", parameterName))
-		}
-
-		if _, ok := protectedParameters[parameterName]; ok {
-			violations = append(violations, fmt.Sprintf("found protected customParameter: %v, please remove this parameter from the customParameters list", parameterName))
-		}
-	}
-
-	if len(violations) > 0 {
-		return fmt.Errorf("found the following customParameters violations:\n%s", strings.Join(violations, "\n"))
-	}
-
-	return nil
-}
-
-// customizeContainerFromList finds a container by name and runs a customization
-// function on the container.
-func customizeContainerFromList(containers []corev1.Container, name string, customizer func(*corev1.Container)) []corev1.Container {
-	containers, index := ensureContainerPresent(containers, name, -1)
-	container := containers[index]
-	customizer(&container)
-	containers[index] = container
-	return containers
-}
-
-// ensurePodTemplatePresent defines a pod template in the general process
-// settings.
-func ensurePodTemplatePresent(spec *fdbtypes.FoundationDBClusterSpec) {
-	if spec.Processes == nil {
-		spec.Processes = make(map[fdbtypes.ProcessClass]fdbtypes.ProcessSettings)
-	}
-	generalSettings := spec.Processes[fdbtypes.ProcessClassGeneral]
-	if generalSettings.PodTemplate == nil {
-		generalSettings.PodTemplate = &corev1.PodTemplateSpec{}
-	}
-	spec.Processes[fdbtypes.ProcessClassGeneral] = generalSettings
-}
-
-// ensureCustomParametersPresent defines custom parameters for the general process
-// settings.
-func ensureCustomParametersPresent(spec *fdbtypes.FoundationDBClusterSpec) {
-	if spec.Processes == nil {
-		spec.Processes = make(map[fdbtypes.ProcessClass]fdbtypes.ProcessSettings)
-	}
-	generalSettings := spec.Processes[fdbtypes.ProcessClassGeneral]
-	if generalSettings.CustomParameters == nil {
-		params := make([]string, 0)
-		generalSettings.CustomParameters = &params
-	}
-	spec.Processes[fdbtypes.ProcessClassGeneral] = generalSettings
-}
-
-// ensureVolumeClaimPresent defines a volume claim in the general process
-// settings.
-func ensureVolumeClaimPresent(spec *fdbtypes.FoundationDBClusterSpec) {
-	if spec.Processes == nil {
-		spec.Processes = make(map[fdbtypes.ProcessClass]fdbtypes.ProcessSettings)
-	}
-	generalSettings := spec.Processes[fdbtypes.ProcessClassGeneral]
-	if generalSettings.VolumeClaimTemplate == nil {
-		generalSettings.VolumeClaimTemplate = &corev1.PersistentVolumeClaim{}
-	}
-	spec.Processes[fdbtypes.ProcessClassGeneral] = generalSettings
-}
-
-// ensureConfigMapPresent defines a config map in the cluster spec.
-func ensureConfigMapPresent(spec *fdbtypes.FoundationDBClusterSpec) {
-	if spec.ConfigMap == nil {
-		spec.ConfigMap = &corev1.ConfigMap{}
-	}
-}
-
-// mergeLabels merges labels from another part of the cluster spec into the
-// object metadata.
-func mergeLabels(metadata *metav1.ObjectMeta, labels map[string]string) {
-	if metadata.Labels == nil {
-		metadata.Labels = make(map[string]string, len(labels))
-	}
-	for key, value := range labels {
-		_, present := metadata.Labels[key]
-		if !present {
-			metadata.Labels[key] = value
-		}
-	}
-}
-
-// updateProcessSettings runs a customization function on all of the process
-// settings in the cluster spec.
-func updateProcessSettings(spec *fdbtypes.FoundationDBClusterSpec, customizer func(*fdbtypes.ProcessSettings)) {
-	for processClass, settings := range spec.Processes {
-		customizer(&settings)
-		spec.Processes[processClass] = settings
-	}
-}
-
-// updatePodTemplates updates all of the pod templates in the cluster spec.
-// This will also ensure that the general settings contain a pod template, so
-// the customization function is guaranteed to be called at least once.
-func updatePodTemplates(spec *fdbtypes.FoundationDBClusterSpec, customizer func(*corev1.PodTemplateSpec)) {
-	ensurePodTemplatePresent(spec)
-	updateProcessSettings(spec, func(settings *fdbtypes.ProcessSettings) {
-		if settings.PodTemplate == nil {
-			return
-		}
-		customizer(settings.PodTemplate)
-	})
-}
-
-// updateVolumeClaims updates all of the volume claims in the cluster spec.
-// This will also ensure that the general settings contain a volume claim, so
-// the customization function is guaranteed to be called at least once.
-func updateVolumeClaims(spec *fdbtypes.FoundationDBClusterSpec, customizer func(*corev1.PersistentVolumeClaim)) {
-	ensureVolumeClaimPresent(spec)
-	updateProcessSettings(spec, func(settings *fdbtypes.ProcessSettings) {
-		if settings.VolumeClaimTemplate == nil {
-			return
-		}
-		customizer(settings.VolumeClaimTemplate)
-	})
-}
-
-// NormalizeClusterSpec converts a cluster spec into an unambiguous,
-// future-proof form, by applying any implicit defaults and moving configuration
-// from deprecated fields into fully-supported fields.
-func NormalizeClusterSpec(spec *fdbtypes.FoundationDBClusterSpec, options DeprecationOptions) error {
-	if spec.PodTemplate != nil {
-		ensurePodTemplatePresent(spec)
-		generalSettings := spec.Processes[fdbtypes.ProcessClassGeneral]
-		if reflect.DeepEqual(generalSettings.PodTemplate, &corev1.PodTemplateSpec{}) {
-			generalSettings.PodTemplate = spec.PodTemplate
-		}
-		spec.Processes[fdbtypes.ProcessClassGeneral] = generalSettings
-		spec.PodTemplate = nil
-	}
-
-	if spec.SidecarVersion != 0 {
-		if spec.SidecarVersions == nil {
-			spec.SidecarVersions = make(map[string]int)
-		}
-		spec.SidecarVersions[spec.Version] = spec.SidecarVersion
-		spec.SidecarVersion = 0
-	}
-
-	if spec.VolumeClaim != nil {
-		if spec.Processes == nil {
-			spec.Processes = make(map[fdbtypes.ProcessClass]fdbtypes.ProcessSettings)
-		}
-		generalSettings := spec.Processes[fdbtypes.ProcessClassGeneral]
-		if generalSettings.VolumeClaimTemplate == nil {
-			generalSettings.VolumeClaimTemplate = spec.VolumeClaim.DeepCopy()
-		}
-		spec.Processes[fdbtypes.ProcessClassGeneral] = generalSettings
-		spec.VolumeClaim = nil
-	}
-
-	if spec.Processes != nil {
-		for key, settings := range spec.Processes {
-			if settings.VolumeClaim != nil && settings.VolumeClaimTemplate == nil {
-				settings.VolumeClaimTemplate = settings.VolumeClaim
-				settings.VolumeClaim = nil
-				spec.Processes[key] = settings
-			}
-		}
-	}
-
-	if spec.NextInstanceID != 0 {
-		spec.NextInstanceID = 0
-	}
-
-	if spec.PodLabels != nil {
-		updatePodTemplates(spec, func(template *corev1.PodTemplateSpec) {
-			mergeLabels(&template.ObjectMeta, spec.PodLabels)
-		})
-
-		updateVolumeClaims(spec, func(claim *corev1.PersistentVolumeClaim) {
-			mergeLabels(&claim.ObjectMeta, spec.PodLabels)
-		})
-
-		ensureConfigMapPresent(spec)
-		mergeLabels(&spec.ConfigMap.ObjectMeta, spec.PodLabels)
-
-		spec.PodLabels = nil
-	}
-
-	if spec.Resources != nil {
-		updatePodTemplates(spec, func(template *corev1.PodTemplateSpec) {
-			template.Spec.Containers, _ = ensureContainerPresent(template.Spec.Containers, "foundationdb", 0)
-
-			template.Spec.Containers = customizeContainerFromList(template.Spec.Containers, "foundationdb", func(container *corev1.Container) {
-				container.Resources = *spec.Resources
-			})
-		})
-
-		spec.Resources = nil
-	}
-
-	if spec.InitContainers != nil {
-		updatePodTemplates(spec, func(template *corev1.PodTemplateSpec) {
-			template.Spec.InitContainers = append(template.Spec.InitContainers, spec.InitContainers...)
-		})
-
-		spec.InitContainers = nil
-	}
-
-	if spec.Containers != nil {
-		updatePodTemplates(spec, func(template *corev1.PodTemplateSpec) {
-			template.Spec.Containers = append(template.Spec.Containers, spec.Containers...)
-		})
-
-		spec.Containers = nil
-	}
-
-	if spec.Volumes != nil {
-		updatePodTemplates(spec, func(template *corev1.PodTemplateSpec) {
-			if template.Spec.Volumes == nil {
-				template.Spec.Volumes = make([]corev1.Volume, 0, len(spec.Volumes))
-			}
-			template.Spec.Volumes = append(template.Spec.Volumes, spec.Volumes...)
-		})
-		spec.Volumes = nil
-	}
-
-	if spec.PodSecurityContext != nil {
-		updatePodTemplates(spec, func(template *corev1.PodTemplateSpec) {
-			template.Spec.SecurityContext = spec.PodSecurityContext
-		})
-		spec.PodSecurityContext = nil
-	}
-
-	if spec.AutomountServiceAccountToken != nil {
-		updatePodTemplates(spec, func(template *corev1.PodTemplateSpec) {
-			template.Spec.AutomountServiceAccountToken = spec.AutomountServiceAccountToken
-		})
-		spec.AutomountServiceAccountToken = nil
-	}
-
-	if spec.StorageClass != nil {
-		updateVolumeClaims(spec, func(volumeClaim *corev1.PersistentVolumeClaim) {
-			volumeClaim.Spec.StorageClassName = spec.StorageClass
-		})
-		spec.StorageClass = nil
-	}
-
-	if spec.VolumeSize != "" {
-		storageQuantity, err := resource.ParseQuantity(spec.VolumeSize)
-		if err != nil {
-			return err
-		}
-		updateVolumeClaims(spec, func(volumeClaim *corev1.PersistentVolumeClaim) {
-			if volumeClaim.Spec.Resources.Requests == nil {
-				volumeClaim.Spec.Resources.Requests = corev1.ResourceList{}
-			}
-			volumeClaim.Spec.Resources.Requests[corev1.ResourceStorage] = storageQuantity
-		})
-		spec.VolumeSize = ""
-	}
-
-	if spec.RunningVersion != "" {
-		spec.RunningVersion = ""
-	}
-
-	if spec.ConnectionString != "" {
-		spec.ConnectionString = ""
-	}
-
-	if len(spec.CustomParameters) > 0 {
-		params := spec.CustomParameters
-		ensureCustomParametersPresent(spec)
-		for processClass, settings := range spec.Processes {
-			settings.CustomParameters = &params
-			spec.Processes[processClass] = settings
-		}
-		spec.CustomParameters = nil
-	}
-
-	// Validate customParameters
-	for processClass := range spec.Processes {
-		if setting, ok := spec.Processes[processClass]; ok {
-			if setting.CustomParameters == nil {
-				continue
-			}
-
-			err := ValidateCustomParameters(*setting.CustomParameters)
-			if err != nil {
-				return err
-			}
-		}
-	}
-
-	if !options.OnlyShowChanges {
-		// Set up resource requirements for the main container.
-		updatePodTemplates(spec, func(template *corev1.PodTemplateSpec) {
-			template.Spec.Containers, _ = ensureContainerPresent(template.Spec.Containers, "foundationdb", 0)
-
-			template.Spec.Containers = customizeContainerFromList(template.Spec.Containers, "foundationdb", func(container *corev1.Container) {
-				if container.Resources.Requests == nil {
-					container.Resources.Requests = corev1.ResourceList{
-						"cpu":    resource.MustParse("1"),
-						"memory": resource.MustParse("1Gi"),
-					}
-				}
-
-				if container.Resources.Limits == nil {
-					container.Resources.Limits = container.Resources.Requests
-				}
-			})
-		})
-
-		if spec.Services.PublicIPSource == nil {
-			source := fdbtypes.PublicIPSourcePod
-			spec.Services.PublicIPSource = &source
-		}
-
-		if spec.AutomationOptions.Replacements.Enabled == nil {
-			enabled := false
-			spec.AutomationOptions.Replacements.Enabled = &enabled
-		}
-
-		if spec.AutomationOptions.Replacements.FailureDetectionTimeSeconds == nil {
-			duration := 1800
-			spec.AutomationOptions.Replacements.FailureDetectionTimeSeconds = &duration
-		}
-	}
-
-	// Apply changes between old and new defaults.
-	// When we update the defaults in the next release, the following sections
-	// should be moved under the `!OnlyShowChanges` section, and we should use
-	// the latest defaults as the active defaults.
-
-	// Set up sidecar resource requirements
-
-	zeroQuantity, err := resource.ParseQuantity("0")
-	if err != nil {
-		return err
-	}
-
-	updatePodTemplates(spec, func(template *corev1.PodTemplateSpec) {
-		sidecarUpdater := func(container *corev1.Container) {
-			if options.UseFutureDefaults {
-				if container.Resources.Requests == nil {
-					container.Resources.Requests = corev1.ResourceList{
-						"cpu":    resource.MustParse("100m"),
-						"memory": resource.MustParse("256Mi"),
-					}
-				}
-				if container.Resources.Limits == nil {
-					container.Resources.Limits = container.Resources.Requests
-				}
-			} else {
-				if options.OnlyShowChanges {
-					if container.Resources.Requests == nil {
-						container.Resources.Requests = corev1.ResourceList{
-							"org.foundationdb/empty": zeroQuantity,
-						}
-					}
-					if container.Resources.Limits == nil {
-						container.Resources.Limits = corev1.ResourceList{
-							"org.foundationdb/empty": zeroQuantity,
-						}
-					}
-				}
-			}
-		}
-
-		template.Spec.InitContainers = customizeContainerFromList(template.Spec.InitContainers, "foundationdb-kubernetes-init", sidecarUpdater)
-		template.Spec.Containers = customizeContainerFromList(template.Spec.Containers, "foundationdb-kubernetes-sidecar", sidecarUpdater)
-	})
-	return nil
 }
 
 func getStorageServersPerPodForInstance(instance *FdbInstance) (int, error) {

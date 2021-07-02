@@ -1,0 +1,45 @@
+# This file provides an example of a cluster you can run in a local testing
+# environment to create a simulation of a multi-DC cluster.
+#
+# This requires variables to be interpolated for $dc, $logCount,
+# and $connectionString
+apiVersion: apps.foundationdb.org/v1beta1
+kind: FoundationDBCluster
+metadata:
+  labels:
+    cluster-group: test-cluster
+  name: test-cluster-$dc
+spec:
+  version: 6.2.30
+  faultDomain:
+    key: foundationdb.org/none
+  instanceIDPrefix: $dc
+  dataCenter: $dc
+  processCounts:
+    stateless: -1
+    log: $logCount
+  seedConnectionString: $connectionString
+  customParameters:
+    - "knob_disable_posix_kernel_aio=1"
+  databaseConfiguration:
+    redundancy_mode: "double"
+    usable_regions: 1
+    regions:
+      - datacenters:
+          - id: $dc
+            priority: 1
+  processes:
+    general:
+      volumeClaimTemplate:
+        spec:
+          resources:
+            requests:
+              storage: "16G"
+      podTemplate:
+        spec:
+          containers:
+            - name: foundationdb
+              resources:
+                requests:
+                  cpu: 250m
+                  memory: 128Mi

@@ -1,17 +1,18 @@
 
 # Image URL to use all building/pushing image targets
 IMG ?= fdb-kubernetes-operator:latest
-
-# Produce CRDs that work back to Kubernetes 1.11 (no version conversion)
-# TODO (johscheuer): #334
-CRD_OPTIONS ?= "crd:trivialVersions=true,maxDescLen=0,crdVersions=v1beta1"
-GENERATED_CRDS = ./config/crd/bases/apps.foundationdb.org_foundationdbbackups.yaml ./config/crd/bases/apps.foundationdb.org_foundationdbclusters.yaml ./config/crd/bases/apps.foundationdb.org_foundationdbrestores.yaml
-
-CONTROLLER_GEN_VERSION ?= 0.5.0
+CRD_OPTIONS ?= "crd:trivialVersions=true,maxDescLen=0,crdVersions=v1,generateEmbeddedObjectMeta=true"
+CONTROLLER_GEN_VERSION ?= 0.6.0-beta.0
 
 ifneq "$(FDB_WEBSITE)" ""
 	docker_build_args := $(docker_build_args) --build-arg FDB_WEBSITE=$(FDB_WEBSITE)
 endif
+
+ifdef RUN_E2E
+	 E2E_TAG := --tags=e2e
+endif
+
+
 
 # TAG is used to define the version in the kubectl-fdb plugin.
 # If not defined we use the current git hash.
@@ -51,14 +52,14 @@ clean:
 # Run tests
 test:
 ifneq "$(SKIP_TEST)" "1"
-	go test ${go_test_flags} ./... -coverprofile cover.out
+	go test ${go_test_flags} ./... -coverprofile cover.out $(E2E_TAG)
 endif
 
 test_if_changed: cover.out
 
 cover.out: ${GO_ALL} ${MANIFESTS}
 ifneq "$(SKIP_TEST)" "1"
-	go test ${go_test_flags} ./... -coverprofile cover.out -tags test
+	go test ${go_test_flags} ./... -coverprofile cover.out -tags test $(E2E_TAG)
 endif
 
 # Build manager binary
@@ -102,12 +103,10 @@ manifests: ${MANIFESTS}
 
 ${MANIFESTS}: ${CONTROLLER_GEN} ${GO_SRC}
 	$(CONTROLLER_GEN) $(CRD_OPTIONS) rbac:roleName=manager-role webhook paths="./..." output:crd:artifacts:config=config/crd/bases
-	# TODO (johscheuer): #524 remove this workaround once we use apiextensions.k8s.io/v1
-	# ref: https://github.com/kubernetes/kubernetes/issues/91395
-	# in v1beta1 defaulting is not allowed so we remove the default value
-	sed -i '/default: TCP/d' $(GENERATED_CRDS)
-	# See: https://github.com/kubernetes-sigs/controller-tools/issues/529
-	sed -i  '/- protocol/d' $(GENERATED_CRDS)
+	# See: https://github.com/kubernetes-sigs/controller-tools/issues/476 remove after the next release (and add a note in the release)
+	yq e '.spec.preserveUnknownFields = false' -i ./config/crd/bases/apps.foundationdb.org_foundationdbbackups.yaml
+	yq e '.spec.preserveUnknownFields = false' -i ./config/crd/bases/apps.foundationdb.org_foundationdbclusters.yaml
+	yq e '.spec.preserveUnknownFields = false' -i ./config/crd/bases/apps.foundationdb.org_foundationdbrestores.yaml
 
 # Run go fmt against code
 fmt: bin/fmt_check

@@ -22,6 +22,7 @@ package controllers
 
 import (
 	ctx "context"
+	"fmt"
 	"time"
 
 	fdbtypes "github.com/FoundationDB/fdb-kubernetes-operator/api/v1beta1"
@@ -32,46 +33,68 @@ import (
 type ReplaceFailedPods struct{}
 
 // Reconcile runs the reconciler's work.
-func (c ReplaceFailedPods) Reconcile(r *FoundationDBClusterReconciler, context ctx.Context, cluster *fdbtypes.FoundationDBCluster) (bool, error) {
+func (c ReplaceFailedPods) Reconcile(r *FoundationDBClusterReconciler, context ctx.Context, cluster *fdbtypes.FoundationDBCluster) *Requeue {
 	if chooseNewRemovals(cluster) {
 		err := r.Status().Update(context, cluster)
 		if err != nil {
-			return false, err
+			return &Requeue{Error: err}
 		}
 
-		return false, nil
+		return &Requeue{Message: "Removals have been updated in the cluster status"}
 	}
 
-	return true, nil
+	return nil
 }
 
 // chooseNewRemovals flags failed processes for removal and returns an indicator
 // of whether any processes were thus flagged.
 func chooseNewRemovals(cluster *fdbtypes.FoundationDBCluster) bool {
+	if !*cluster.Spec.AutomationOptions.Replacements.Enabled {
+		return false
+	}
+
+	// The maximum number of removals will be the defined number in the cluster spec
+	// minus all currently ongoing removals e.g. process groups marked fro removal but
+	// not fully excluded.
+	removalCount := 0
 	for _, processGroupStatus := range cluster.Status.ProcessGroups {
 		if processGroupStatus.Remove && !processGroupStatus.Excluded {
 			// If we already have a removal in-flight, we should not try
 			// replacing more failed pods.
-			return false
+			removalCount++
 		}
 	}
+	maxReplacements := cluster.GetMaxConcurrentReplacements() - removalCount
 
+	hasReplacement := false
 	for _, processGroupStatus := range cluster.Status.ProcessGroups {
-		missingTime := processGroupStatus.GetConditionTime(fdbtypes.MissingProcesses)
-		failureWindowStart := time.Now().Add(-1 * time.Duration(*cluster.Spec.AutomationOptions.Replacements.FailureDetectionTimeSeconds) * time.Second).Unix()
-		needsReplacement := missingTime != nil && *missingTime < failureWindowStart && !processGroupStatus.Remove
+		if maxReplacements <= 0 {
+			return hasReplacement
+		}
+
+		needsReplacement, missingTime := processGroupStatus.NeedsReplacement(*cluster.Spec.AutomationOptions.Replacements.FailureDetectionTimeSeconds)
 		if needsReplacement && *cluster.Spec.AutomationOptions.Replacements.Enabled {
-			log.Info("Replacing failed process group", "namespace", cluster.Namespace, "cluster", cluster.Name, "processGroupID", processGroupStatus.ProcessGroupID, "failureTime", *missingTime)
+			if len(processGroupStatus.Addresses) == 0 {
+				log.Info(
+					"Ignore failed process group with missing address",
+					"namespace", cluster.Namespace,
+					"cluster", cluster.Name,
+					"processGroupID", processGroupStatus.ProcessGroupID,
+					"failureTime", time.Unix(missingTime, 0).UTC().String())
+				continue
+			}
+
+			log.Info("Replace instance",
+				"namespace", cluster.Namespace,
+				"name", cluster.Name,
+				"processGroupID", processGroupStatus.ProcessGroupID,
+				"reason", fmt.Sprintf("automatic replacement detected failure time: %s", time.Unix(missingTime, 0).UTC().String()))
+
 			processGroupStatus.Remove = true
-			return true
+			hasReplacement = true
+			maxReplacements--
 		}
 	}
 
-	return false
-}
-
-// RequeueAfter returns the delay before we should run the reconciliation
-// again.
-func (c ReplaceFailedPods) RequeueAfter() time.Duration {
-	return 0
+	return hasReplacement
 }

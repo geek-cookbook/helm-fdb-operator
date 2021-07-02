@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2020 Apple Inc. and the FoundationDB project authors
+ * Copyright 2020-2021 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -22,15 +22,17 @@ package controllers
 
 import (
 	ctx "context"
-	"fmt"
-	"time"
+
+	"sigs.k8s.io/controller-runtime/pkg/controller"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
+
+	"golang.org/x/net/context"
 
 	"golang.org/x/net/context"
 
 	fdbtypes "github.com/FoundationDB/fdb-kubernetes-operator/api/v1beta1"
 	"github.com/go-logr/logr"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -40,10 +42,12 @@ import (
 // FoundationDBRestoreReconciler reconciles a FoundationDBRestore object
 type FoundationDBRestoreReconciler struct {
 	client.Client
-	Recorder            record.EventRecorder
-	Log                 logr.Logger
-	scheme              *runtime.Scheme
-	InSimulation        bool
+	Recorder     record.EventRecorder
+	Log          logr.Logger
+	InSimulation bool
+
+	DatabaseClientProvider DatabaseClientProvider
+	// Deprecated: Use DatabaseClientProvider instead
 	AdminClientProvider func(*fdbtypes.FoundationDBCluster, client.Client) (AdminClient, error)
 }
 
@@ -65,8 +69,6 @@ func (r *FoundationDBRestoreReconciler) Reconcile(ctx context.Context, request c
 	restore := &fdbtypes.FoundationDBRestore{}
 	err := r.Get(ctx, request.NamespacedName, restore)
 
-	originalGeneration := restore.ObjectMeta.Generation
-
 	if err != nil {
 		if k8serrors.IsNotFound(err) {
 			// Object not found, return.  Created objects are automatically garbage collected.
@@ -77,31 +79,35 @@ func (r *FoundationDBRestoreReconciler) Reconcile(ctx context.Context, request c
 		return ctrl.Result{}, err
 	}
 
+	restoreLog := log.WithValues("namespace", restore.Namespace, "restore", restore.Name)
+
 	subReconcilers := []RestoreSubReconciler{
 		StartRestore{},
 	}
 
 	for _, subReconciler := range subReconcilers {
-		canContinue, err := subReconciler.Reconcile(r, ctx, restore)
-		if !canContinue || err != nil {
-			log.Info("Reconciliation terminated early", "namespace", restore.Namespace, "restore", restore.Name, "lastAction", fmt.Sprintf("%T", subReconciler))
+		requeue := subReconciler.Reconcile(r, ctx, restore)
+		if requeue == nil {
+			continue
 		}
 
-		if err != nil {
-			log.Error(err, "Error in reconciliation", "subReconciler", fmt.Sprintf("%T", subReconciler), "namespace", restore.Namespace, "restore", restore.Name)
-			return ctrl.Result{}, err
-		} else if restore.ObjectMeta.Generation != originalGeneration {
-			log.Info("Ending reconciliation early because restore has been updated")
-			return ctrl.Result{}, nil
-		} else if !canContinue {
-			log.Info("Requeuing reconciliation", "subReconciler", fmt.Sprintf("%T", subReconciler), "namespace", restore.Namespace, "restore", restore.Name)
-			return ctrl.Result{Requeue: true, RequeueAfter: subReconciler.RequeueAfter()}, nil
-		}
+		return processRequeue(requeue, subReconciler, restore, r.Recorder, restoreLog)
 	}
 
-	log.Info("Reconciliation complete", "namespace", restore.Namespace, "restore", restore.Name)
+	restoreLog.Info("Reconciliation complete")
 
 	return ctrl.Result{}, nil
+}
+
+// getDatabaseClientProvider gets the client provider for a reconciler.
+func (r *FoundationDBRestoreReconciler) getDatabaseClientProvider() DatabaseClientProvider {
+	if r.DatabaseClientProvider != nil {
+		return r.DatabaseClientProvider
+	}
+	if r.AdminClientProvider != nil {
+		return legacyDatabaseClientProvider{AdminClientProvider: r.AdminClientProvider}
+	}
+	panic("Restore reconciler does not have a DatabaseClientProvider defined")
 }
 
 // AdminClientForRestore provides an admin client for a restore reconciler.
@@ -112,13 +118,18 @@ func (r *FoundationDBRestoreReconciler) AdminClientForRestore(context ctx.Contex
 		return nil, err
 	}
 
-	return r.AdminClientProvider(cluster, r)
+	return r.getDatabaseClientProvider().GetAdminClient(cluster, r)
 }
 
 // SetupWithManager prepares a reconciler for use.
-func (r *FoundationDBRestoreReconciler) SetupWithManager(mgr ctrl.Manager) error {
+func (r *FoundationDBRestoreReconciler) SetupWithManager(mgr ctrl.Manager, maxConcurrentReconciles int) error {
 	return ctrl.NewControllerManagedBy(mgr).
+		WithOptions(controller.Options{
+			MaxConcurrentReconciles: maxConcurrentReconciles},
+		).
 		For(&fdbtypes.FoundationDBRestore{}).
+		// Only react on generation changes or annotation changes
+		WithEventFilter(predicate.Or(predicate.GenerationChangedPredicate{}, predicate.AnnotationChangedPredicate{})).
 		Complete(r)
 }
 
@@ -128,20 +139,13 @@ type RestoreSubReconciler interface {
 	/**
 	Reconcile runs the reconciler's work.
 
-	If reconciliation can continue, this should return (true, nil).
+	If reconciliation can continue, this should return nil.
 
-	If reconciliation encounters an error, this should return (false, err).
+	If reconciliation encounters an error, this should return a `Requeue` object
+	with an `Error` field.
 
-	If reconciliation cannot proceed, or if this method has to make a change
-	to the restore spec, this should return (false, nil).
-
-	This method will only be called once for a given instance of the reconciler.
+	If reconciliation cannot proceed, this should return a `Requeue` object with
+	a `Message` field.
 	*/
-	Reconcile(r *FoundationDBRestoreReconciler, context ctx.Context, restore *fdbtypes.FoundationDBRestore) (bool, error)
-
-	/**
-	RequeueAfter returns the delay before we should run the reconciliation
-	again.
-	*/
-	RequeueAfter() time.Duration
+	Reconcile(r *FoundationDBRestoreReconciler, context ctx.Context, restore *fdbtypes.FoundationDBRestore) *Requeue
 }

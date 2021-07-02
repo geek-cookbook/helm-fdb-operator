@@ -21,22 +21,30 @@
 package cmd
 
 import (
-	"bufio"
 	"bytes"
-	"testing"
 
+	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/gomega"
 	"k8s.io/cli-runtime/pkg/genericclioptions"
 )
 
-func TestRootCmd(t *testing.T) {
-	// We use these buffers to theoretically check the input/output
-	outBuffer := bytes.Buffer{}
-	errBuffer := bytes.Buffer{}
-	inBuffer := bytes.Buffer{}
+var _ = Describe("[plugin] root command", func() {
+	When("running the root command without args", func() {
+		var outBuffer bytes.Buffer
+		var errBuffer bytes.Buffer
+		var inBuffer bytes.Buffer
 
-	cmd := NewRootCmd(genericclioptions.IOStreams{In: bufio.NewReader(&inBuffer), Out: bufio.NewWriter(&outBuffer), ErrOut: bufio.NewWriter(&errBuffer)})
-	err := cmd.Execute()
-	if err != nil {
-		t.Error(err)
-	}
-}
+		BeforeEach(func() {
+			// We use these buffers to check the input/output
+			outBuffer = bytes.Buffer{}
+			errBuffer = bytes.Buffer{}
+			inBuffer = bytes.Buffer{}
+		})
+
+		It("should not throw an error", func() {
+			cmd := NewRootCmd(genericclioptions.IOStreams{In: &inBuffer, Out: &outBuffer, ErrOut: &errBuffer})
+			cmd.SetArgs([]string{})
+			Expect(cmd.Execute()).NotTo(HaveOccurred())
+		})
+	})
+})

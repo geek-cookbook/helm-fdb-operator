@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2020 Apple Inc. and the FoundationDB project authors
+ * Copyright 2020-2021 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -21,66 +21,27 @@
 package controllers
 
 import (
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"fmt"
+	"time"
 
-	fdbtypes "github.com/FoundationDB/fdb-kubernetes-operator/api/v1beta1"
+	"github.com/go-logr/logr"
+	corev1 "k8s.io/api/core/v1"
+	k8serrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/tools/record"
+	ctrl "sigs.k8s.io/controller-runtime"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
 )
 
 var log = logf.Log.WithName("controller")
 
-// DefaultCLITimeout is the default timeout for CLI commands.
-var DefaultCLITimeout = 10
-
 const (
-	// LastSpecKey provides the annotation name we use to store the hash of the
-	// pod spec.
-	LastSpecKey = "foundationdb.org/last-applied-spec"
+	clusterFileKey = "cluster-file"
 
-	// LastConfigMapKey provides the annotation name we use to store the hash of the
-	// config map.
-	LastConfigMapKey = "foundationdb.org/last-applied-config-map"
-
-	// BackupDeploymentLabel provides the label we use to connect backup
-	// deployments to a cluster.
-	BackupDeploymentLabel = "foundationdb.org/backup-for"
-
-	// MinimumUptimeSecondsForBounce defines the minimum time, in seconds, that the
-	// processes in the cluster must have been up for before the operator can
-	// execute a bounce.
-	MinimumUptimeSecondsForBounce = 600
-
-	// PublicIPSourceAnnotation is an annotation key that specifies where a pod
-	// gets its public IP from.
-	PublicIPSourceAnnotation = "foundationdb.org/public-ip-source"
-
-	// PublicIPAnnotation is an annotation key that specifies the current public
-	// IP for a pod.
-	PublicIPAnnotation = "foundationdb.org/public-ip"
-
-	// FDBInstanceIDLabel represents the label that is used to represent a instance ID
-	FDBInstanceIDLabel = "fdb-instance-id"
-
-	// FDBProcessClassLabel represents the label that is used to represent the process class
-	FDBProcessClassLabel = "fdb-process-class"
-
-	// FDBClusterLabel represents the label that is used to represent the cluster of an instance
-	FDBClusterLabel = "fdb-cluster-name"
-
-	// NodeSelectorNoScheduleLabel is a label used when adding node selectors to block scheduling.
-	NodeSelectorNoScheduleLabel = "foundationdb.org/no-schedule-allowed"
-
-	// FDBLocalityInstanceIDKey represents the key in the locality map that
-	// holds the instance ID.
-	FDBLocalityInstanceIDKey = "instance_id"
-
-	// FDBLocalityZoneIDKey represents the key in the locality map that holds
-	// the zone ID.
-	FDBLocalityZoneIDKey = "zoneid"
-
-	// FDBLocalityDCIDKey represents the key in the locality map that holds
-	// the DC ID.
-	FDBLocalityDCIDKey = "dcid"
+	// podSchedulingDelayDuration determines how long we should delay a requeue
+	// of reconciliation when a pod is not ready.
+	podSchedulingDelayDuration = 15 * time.Second
 )
 
 // metadataMatches determines if the current metadata on an object matches the
@@ -119,19 +80,38 @@ func mergeMap(target map[string]string, desired map[string]string) bool {
 	return changed
 }
 
-// processClassFromLabel extracts the ProcessClass label from the metav1.ObjectMeta.Labels map
-func processClassFromLabels(labels map[string]string) fdbtypes.ProcessClass {
-	return fdbtypes.ProcessClass(labels[FDBProcessClassLabel])
+// Requeue provides a wrapper around different results from a subreconciler.
+type Requeue struct {
+	// Delay provides an optional delay before requeueing reconciliattion.
+	Delay time.Duration
+
+	// Error provides an error that we encountered that forced a requeue.
+	Error error
+
+	// Message provides a log message that explains the reason for the requeue.
+	Message string
 }
 
-// DeprecationOptions controls how deprecations and changes to defaults
-// get applied to our specs.
-type DeprecationOptions struct {
-	// Whether we should apply the latest defaults rather than the defaults that
-	// were initially established for this major version.
-	UseFutureDefaults bool
+// processRequeue interprets a requeue resulit from a subreconciler.
+func processRequeue(requeue *Requeue, subReconciler interface{}, object runtime.Object, recorder record.EventRecorder, logger logr.Logger) (ctrl.Result, error) {
+	if requeue.Message == "" && requeue.Error != nil {
+		requeue.Message = requeue.Error.Error()
+	}
 
-	// Whether we should only fill in defaults that have changes between major
-	// versions of the operator.
-	OnlyShowChanges bool
+	err := requeue.Error
+	if err != nil && k8serrors.IsConflict(err) {
+		err = nil
+		if requeue.Delay == time.Duration(0) {
+			requeue.Delay = time.Minute
+		}
+	}
+
+	recorder.Event(object, corev1.EventTypeNormal, "ReconciliationTerminatedEarly", requeue.Message)
+
+	if err != nil {
+		logger.Error(err, "Error in reconciliation", "subReconciler", fmt.Sprintf("%T", subReconciler), "requeueAfter", requeue.Delay)
+		return ctrl.Result{}, err
+	}
+	logger.Info("Reconciliation terminated early", "subReconciler", fmt.Sprintf("%T", subReconciler), "message", requeue.Message, "requeueAfter", requeue.Delay)
+	return ctrl.Result{Requeue: true, RequeueAfter: requeue.Delay}, nil
 }

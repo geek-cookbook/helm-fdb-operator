@@ -1,6 +1,9 @@
 apiVersion: v2
 name: fdb-operator
 description: A Helm chart for foundationDB operator
+home: https://www.foundationdb.org/
+sources:
+- https://github.com/FoundationDB/fdb-kubernetes-operator/tree/master/helm/fdb-operator
 
 # A chart can be either an 'application' or a 'library' chart.
 #
@@ -14,20 +17,8 @@ type: application
 
 # This is the chart version. This version number should be incremented each time you make changes
 # to the chart and its templates, including the app version.
-version: 0.29.1
+version: 0.37.0 # customized for our repo's use
 
 # This is the version number of the application being deployed. This version number should be
 # incremented each time you make changes to the application.
-appVersion: 0.32.0
-home: https://github.com/FoundationDB/fdb-kubernetes-operator
-
-sources:
-    - https://github.com/FoundationDB/fdb-kubernetes-operator
-
-maintainers:
-    - name: brownleej
-      email: apps@johnbrownlee.com
-      url: https://github.com/brownleej
-    - name: funkypenguin
-      email: davidy@funkypenguin.co.nz
-      url: https://www.funkypenguin.co.nz
+appVersion: 0.37.0

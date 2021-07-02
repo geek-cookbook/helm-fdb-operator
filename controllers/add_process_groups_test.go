@@ -32,7 +32,7 @@ import (
 var _ = Describe("add_process_groups", func() {
 	var cluster *fdbtypes.FoundationDBCluster
 	var err error
-	var shouldContinue bool
+	var requeue *Requeue
 	var initialProcessCounts fdbtypes.ProcessCounts
 	var newProcessCounts fdbtypes.ProcessCounts
 
@@ -53,8 +53,11 @@ var _ = Describe("add_process_groups", func() {
 	})
 
 	JustBeforeEach(func() {
-		shouldContinue, err = AddProcessGroups{}.Reconcile(clusterReconciler, context.TODO(), cluster)
-		Expect(err).NotTo(HaveOccurred())
+		requeue = AddProcessGroups{}.Reconcile(clusterReconciler, context.TODO(), cluster)
+		if requeue != nil {
+			Expect(requeue.Error).NotTo(HaveOccurred())
+		}
+
 		_, err = reloadCluster(cluster)
 		Expect(err).NotTo(HaveOccurred())
 		newProcessCounts = fdbtypes.CreateProcessCountsFromProcessGroupStatus(cluster.Status.ProcessGroups, true)
@@ -63,7 +66,7 @@ var _ = Describe("add_process_groups", func() {
 
 	Context("with a reconciled cluster", func() {
 		It("should not requeue", func() {
-			Expect(shouldContinue).To(BeTrue())
+			Expect(requeue).To(BeNil())
 		})
 
 		It("should not change the process counts", func() {
@@ -142,7 +145,7 @@ var _ = Describe("add_process_groups", func() {
 		})
 
 		It("should not requeue", func() {
-			Expect(shouldContinue).To(BeTrue())
+			Expect(requeue).To(BeNil())
 		})
 
 		It("should add storage processes", func() {
@@ -194,6 +197,22 @@ var _ = Describe("add_process_groups", func() {
 					"storage-7",
 				}))
 			})
+		})
+	})
+
+	When("a new processGroup is created", func() {
+		var processGroupStatus *fdbtypes.ProcessGroupStatus
+
+		BeforeEach(func() {
+			processGroupStatus = fdbtypes.NewProcessGroupStatus("1337", fdbtypes.ProcessClassStorage, []string{"1.1.1.1"})
+		})
+
+		It("should have the missing conditions", func() {
+			Expect(err).NotTo(HaveOccurred())
+			Expect(len(processGroupStatus.ProcessGroupConditions)).To(Equal(3))
+			Expect(processGroupStatus.ProcessGroupConditions[0].ProcessGroupConditionType).To(Equal(fdbtypes.MissingProcesses))
+			Expect(processGroupStatus.ProcessGroupConditions[1].ProcessGroupConditionType).To(Equal(fdbtypes.MissingPod))
+			Expect(processGroupStatus.ProcessGroupConditions[2].ProcessGroupConditionType).To(Equal(fdbtypes.MissingPVC))
 		})
 	})
 })

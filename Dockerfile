@@ -1,33 +1,39 @@
+FROM foundationdb/foundationdb:6.2.30 as fdb62
+FROM foundationdb/foundationdb:6.1.13 as fdb61
+FROM foundationdb/foundationdb:6.3.10 as fdb63
+
 # Build the manager binary
-FROM golang:1.15.8 as builder
+FROM golang:1.15.13 as builder
 
 # Install FDB
-ARG FDB_VERSION=6.2.29
+ARG FDB_VERSION=6.2.30
 ARG FDB_WEBSITE=https://www.foundationdb.org
 
 COPY foundationdb-kubernetes-sidecar/website/ /mnt/website/
 
-# FIXME: Workaround for (https://github.com/FoundationDB/fdb-kubernetes-operator/issues/252#issuecomment-643812649)
-# adds GeoTrust_Global_CA.crt during install and removes it afterwards
-COPY ./foundationdb-kubernetes-sidecar/files/GeoTrust_Global_CA.pem /usr/local/share/ca-certificates/GeoTrust_Global_CA.crt
 RUN set -eux && \
-	update-ca-certificates --fresh && \
-	curl --fail $FDB_WEBSITE/downloads/$FDB_VERSION/ubuntu/installers/foundationdb-clients_$FDB_VERSION-1_amd64.deb -o fdb.deb && \
+	curl --fail ${FDB_WEBSITE}/downloads/${FDB_VERSION}/ubuntu/installers/foundationdb-clients_${FDB_VERSION}-1_amd64.deb -o fdb.deb && \
 	dpkg -i fdb.deb && rm fdb.deb && \
-	mkdir -p /usr/lib/fdb && \
-	rm /usr/local/share/ca-certificates/GeoTrust_Global_CA.crt && \
-	update-ca-certificates --fresh
+	curl --fail $FDB_WEBSITE/downloads/$FDB_VERSION/linux/fdb_$FDB_VERSION.tar.gz -o fdb_$FDB_VERSION.tar.gz && \
+	tar -xzf fdb_$FDB_VERSION.tar.gz --strip-components=1 && \
+	rm fdb_$FDB_VERSION.tar.gz && \
+	chmod u+x fdbbackup fdbcli fdbdr fdbmonitor fdbrestore fdbserver backup_agent dr_agent && \
+	mkdir -p /usr/bin/fdb/${FDB_VERSION%.*} && \
+	mv fdbbackup fdbcli fdbdr fdbmonitor fdbrestore fdbserver backup_agent dr_agent /usr/bin/fdb/${FDB_VERSION%.*} && \
+	mkdir -p /usr/lib/fdb
+
+# TODO: Remove the behavior of copying binaries from the FDB images as part of the 1.0 release of the operator.
 
 # Copy 6.2 binaries
-COPY --from=foundationdb/foundationdb:6.2.29 /usr/bin/fdb* /usr/bin/fdb/6.2/
+COPY --from=fdb62 /usr/bin/fdb* /usr/bin/fdb/6.2/
 
 # Copy 6.1 binaries
-COPY --from=foundationdb/foundationdb:6.1.13 /usr/bin/fdb* /usr/bin/fdb/6.1/
-COPY --from=foundationdb/foundationdb:6.1.13 /usr/lib/libfdb_c.so /usr/lib/fdb/libfdb_c_6.1.so
+COPY --from=fdb61 /usr/bin/fdb* /usr/bin/fdb/6.1/
+COPY --from=fdb61 /usr/lib/libfdb_c.so /usr/lib/fdb/libfdb_c_6.1.so
 
 # Copy 6.3 binaries
-COPY --from=foundationdb/foundationdb:6.3.5 /usr/bin/fdb* /usr/bin/fdb/6.3/
-COPY --from=foundationdb/foundationdb:6.3.5 /usr/lib/libfdb_c.so /usr/lib/fdb/libfdb_c_6.3.so
+COPY --from=fdb63 /usr/bin/fdb* /usr/bin/fdb/6.3/
+COPY --from=fdb63 /usr/lib/libfdb_c.so /usr/lib/fdb/libfdb_c_6.3.so
 
 WORKDIR /workspace
 # Copy the Go Modules manifests
@@ -41,6 +47,9 @@ RUN go mod download
 COPY main.go main.go
 COPY api/ api/
 COPY controllers/ controllers/
+COPY setup/ setup/
+COPY fdbclient/ fdbclient/
+COPY internal/ internal/
 
 # Build
 RUN CGO_ENABLED=1 GOOS=linux GOARCH=amd64 GO111MODULE=on go build -a -o manager main.go

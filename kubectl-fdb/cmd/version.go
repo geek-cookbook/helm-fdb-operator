@@ -36,7 +36,7 @@ import (
 
 var pluginVersion = "latest"
 
-func newVersionCmd(streams genericclioptions.IOStreams, rootCmd *cobra.Command) *cobra.Command {
+func newVersionCmd(streams genericclioptions.IOStreams) *cobra.Command {
 	o := NewFDBOptions(streams)
 
 	cmd := &cobra.Command{
@@ -44,7 +44,7 @@ func newVersionCmd(streams genericclioptions.IOStreams, rootCmd *cobra.Command) 
 		Short: "version of kubectl-fdb & foundationdb-operator",
 		Long:  `version of kubectl-fdb and current running foundationdb-operator`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			operatorName, err := rootCmd.Flags().GetString("operator-name")
+			operatorName, err := cmd.Root().Flags().GetString("operator-name")
 			if err != nil {
 				return err
 			}
@@ -57,26 +57,26 @@ func newVersionCmd(streams genericclioptions.IOStreams, rootCmd *cobra.Command) 
 				return nil
 			}
 
-			config, err := o.configFlags.ToRESTConfig()
-			if err != nil {
-				return err
-			}
-
-			scheme := runtime.NewScheme()
-			_ = clientgoscheme.AddToScheme(scheme)
-			_ = fdbtypes.AddToScheme(scheme)
-
-			kubeClient, err := client.New(config, client.Options{Scheme: scheme})
-			if err != nil {
-				return err
-			}
-
-			namespace, err := getNamespace(*o.configFlags.Namespace)
-			if err != nil {
-				return err
-			}
-
 			if !clientOnly {
+				config, err := o.configFlags.ToRESTConfig()
+				if err != nil {
+					return err
+				}
+
+				scheme := runtime.NewScheme()
+				_ = clientgoscheme.AddToScheme(scheme)
+				_ = fdbtypes.AddToScheme(scheme)
+
+				kubeClient, err := client.New(config, client.Options{Scheme: scheme})
+				if err != nil {
+					return err
+				}
+
+				namespace, err := getNamespace(*o.configFlags.Namespace)
+				if err != nil {
+					return err
+				}
+
 				operatorVersion, err := version(kubeClient, operatorName, namespace, containerName)
 				if err != nil {
 					return err
@@ -89,10 +89,14 @@ func newVersionCmd(streams genericclioptions.IOStreams, rootCmd *cobra.Command) 
 			return nil
 		},
 		Example: `
-#Lists the version of kubectl fdb plugin and foundationdb operator in current namespace
+# Lists the version of kubectl fdb plugin and foundationdb operator in current namespace
 kubectl fdb version
-#Lists the version of kubectl fdb plugin and foundationdb operator in provided namespace
+
+# Lists the version of kubectl fdb plugin and foundationdb operator in provided namespace
 kubectl fdb -n default version
+
+# Lists the version of kubectl fdb plugin without checking the operator version
+kubectl fdb version --client-only
 `,
 	}
 	cmd.SetOut(o.Out)

@@ -3,7 +3,7 @@
  *
  * This source file is part of the FoundationDB open source project
  *
- * Copyright 2019 Apple Inc. and the FoundationDB project authors
+ * Copyright 2019-2021 Apple Inc. and the FoundationDB project authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -23,7 +23,8 @@ package controllers
 import (
 	ctx "context"
 	"reflect"
-	"time"
+
+	"k8s.io/apimachinery/pkg/api/equality"
 
 	fdbtypes "github.com/FoundationDB/fdb-kubernetes-operator/api/v1beta1"
 	corev1 "k8s.io/api/core/v1"
@@ -31,24 +32,27 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 )
 
-// UpdateConfigMap provides a reconciliation step for updating the dynamic conf
+// UpdateConfigMap provides a reconciliation step for updating the dynamic config
 // for a cluster.
 type UpdateConfigMap struct{}
 
 // Reconcile runs the reconciler's work.
-func (u UpdateConfigMap) Reconcile(r *FoundationDBClusterReconciler, context ctx.Context, cluster *fdbtypes.FoundationDBCluster) (bool, error) {
+func (u UpdateConfigMap) Reconcile(r *FoundationDBClusterReconciler, context ctx.Context, cluster *fdbtypes.FoundationDBCluster) *Requeue {
 	configMap, err := GetConfigMap(cluster)
 	if err != nil {
-		return false, err
+		return &Requeue{Error: err}
 	}
 	existing := &corev1.ConfigMap{}
 	err = r.Get(context, types.NamespacedName{Namespace: configMap.Namespace, Name: configMap.Name}, existing)
 	if err != nil && k8serrors.IsNotFound(err) {
 		log.Info("Creating config map", "namespace", configMap.Namespace, "cluster", cluster.Name, "name", configMap.Name)
 		err = r.Create(context, configMap)
-		return err == nil, err
+		if err != nil {
+			return &Requeue{Error: err}
+		}
+		return nil
 	} else if err != nil {
-		return false, err
+		return &Requeue{Error: err}
 	}
 
 	metadataCorrect := true
@@ -61,47 +65,15 @@ func (u UpdateConfigMap) Reconcile(r *FoundationDBClusterReconciler, context ctx
 		metadataCorrect = false
 	}
 
-	if !reflect.DeepEqual(existing.Data, configMap.Data) || !metadataCorrect {
+	if !equality.Semantic.DeepEqual(existing.Data, configMap.Data) || !metadataCorrect {
 		log.Info("Updating config map", "namespace", configMap.Namespace, "cluster", cluster.Name, "name", configMap.Name)
-		r.Recorder.Event(cluster, "Normal", "UpdatingConfigMap", "")
+		r.Recorder.Event(cluster, corev1.EventTypeNormal, "UpdatingConfigMap", "")
 		existing.Data = configMap.Data
 		err = r.Update(context, existing)
 		if err != nil {
-			return false, err
+			return &Requeue{Error: err}
 		}
 	}
 
-	configMapHash, err := GetDynamicConfHash(configMap)
-	if err != nil {
-		return false, err
-	}
-
-	instances, err := r.PodLifecycleManager.GetInstances(r, cluster, context, getPodListOptions(cluster, "", "")...)
-	if err != nil {
-		return false, err
-	}
-
-	for index := range instances {
-		instance := instances[index]
-		if instance.Metadata.Annotations[LastConfigMapKey] != configMapHash {
-			synced, err := r.updatePodDynamicConf(cluster, instance)
-			if !synced {
-				return synced, err
-			}
-
-			instance.Metadata.Annotations[LastConfigMapKey] = configMapHash
-			err = r.PodLifecycleManager.UpdateMetadata(r, context, cluster, instance)
-			if err != nil {
-				return false, err
-			}
-		}
-	}
-
-	return true, nil
-}
-
-// RequeueAfter returns the delay before we should run the reconciliation
-// again.
-func (u UpdateConfigMap) RequeueAfter() time.Duration {
-	return time.Duration(30) * time.Second
+	return nil
 }

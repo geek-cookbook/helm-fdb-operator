@@ -43,7 +43,7 @@ var _ = Describe("admin_client_test", func() {
 		Expect(err).NotTo(HaveOccurred())
 
 		result, err := reconcileCluster(cluster)
-		Expect(err).NotTo((HaveOccurred()))
+		Expect(err).NotTo(HaveOccurred())
 		Expect(result.Requeue).To(BeFalse())
 
 		generation, err := reloadCluster(cluster)
@@ -81,14 +81,43 @@ var _ = Describe("admin_client_test", func() {
 
 				Expect(status.Cluster.Processes).To(HaveLen(len(cluster.Status.ProcessGroups)))
 				Expect(status.Cluster.Processes["operator-test-1-storage-1-1"]).To(Equal(fdbtypes.FoundationDBStatusProcessInfo{
-					Address:      "1.1.0.1:4501",
+					Address:      "1.1.1.1:4501",
 					ProcessClass: fdbtypes.ProcessClassStorage,
-					CommandLine:  "/usr/bin/fdbserver --class=storage --cluster_file=/var/fdb/data/fdb.cluster --datadir=/var/fdb/data --locality_instance_id=storage-1 --locality_machineid=operator-test-1-storage-1 --locality_zoneid=operator-test-1-storage-1 --logdir=/var/log/fdb-trace-logs --loggroup=operator-test-1 --public_address=1.1.0.1:4501 --seed_cluster_file=/var/dynamic-conf/fdb.cluster",
+					CommandLine:  "/usr/bin/fdbserver --class=storage --cluster_file=/var/fdb/data/fdb.cluster --datadir=/var/fdb/data --locality_instance_id=storage-1 --locality_machineid=operator-test-1-storage-1 --locality_zoneid=operator-test-1-storage-1 --logdir=/var/log/fdb-trace-logs --loggroup=operator-test-1 --public_address=1.1.1.1:4501 --seed_cluster_file=/var/dynamic-conf/fdb.cluster",
 					Excluded:     false,
 					Locality: map[string]string{
 						"instance_id": "storage-1",
 						"zoneid":      "operator-test-1-storage-1",
 						"dcid":        "",
+					},
+					Version:       "6.2.20",
+					UptimeSeconds: 60000,
+					Roles: []fdbtypes.FoundationDBStatusProcessRoleInfo{
+						{
+							Role: string(fdbtypes.ProcessRoleCoordinator),
+						},
+					},
+				}))
+			})
+		})
+
+		Context("with an additional process", func() {
+			BeforeEach(func() {
+				client.MockAdditionalProcesses([]fdbtypes.ProcessGroupStatus{{
+					ProcessGroupID: "dc2-storage-1",
+					ProcessClass:   "storage",
+					Addresses:      []string{"1.2.3.4"},
+				}})
+			})
+
+			It("puts the additional processes in the status", func() {
+				Expect(status.Cluster.Processes).To(HaveLen(len(cluster.Status.ProcessGroups) + 1))
+				Expect(status.Cluster.Processes["dc2-storage-1"]).To(Equal(fdbtypes.FoundationDBStatusProcessInfo{
+					Address:      "1.2.3.4:4501",
+					ProcessClass: fdbtypes.ProcessClassStorage,
+					Locality: map[string]string{
+						"instance_id": "dc2-storage-1",
+						"zoneid":      "dc2-storage-1",
 					},
 					Version:       "6.2.20",
 					UptimeSeconds: 60000,
@@ -272,7 +301,7 @@ var _ = Describe("admin_client_test", func() {
 
 		Context("with a restore running", func() {
 			BeforeEach(func() {
-				err = client.StartRestore("blobstore://test@test-service/test-backup")
+				err = client.StartRestore("blobstore://test@test-service/test-backup", nil)
 				Expect(err).NotTo(HaveOccurred())
 
 				status, err = client.GetRestoreStatus()
@@ -284,121 +313,4 @@ var _ = Describe("admin_client_test", func() {
 			})
 		})
 	})
-
-	Describe("helper methods", func() {
-		Describe("parseExclusionOutput", func() {
-			It("should map the output description to exclusion success", func() {
-				output := "  10.1.56.36(Whole machine)  ---- Successfully excluded. It is now safe to remove this process from the cluster.\n" +
-					"  10.1.56.43(Whole machine)  ---- Successfully excluded. It is now safe to remove this process from the cluster.\n" +
-					"  10.1.56.52(Whole machine)  ---- Successfully excluded. It is now safe to remove this process from the cluster.\n" +
-					"  10.1.56.53(Whole machine)  ---- WARNING: Missing from cluster! Be sure that you excluded the correct processes" +
-					" before removing them from the cluster!\n" +
-					"  10.1.56.35(Whole machine)  ---- WARNING: Exclusion in progress! It is not safe to remove this process from the cluster\n" +
-					"  10.1.56.56(Whole machine)  ---- Successfully excluded. It is now safe to remove this process from the cluster.\n" +
-					"WARNING: 10.1.56.56:4500 is a coordinator!\n" +
-					"Type `help coordinators' for information on how to change the\n" +
-					"cluster's coordination servers before removing them."
-				results := parseExclusionOutput(output)
-				Expect(results).To(Equal(map[string]string{
-					"10.1.56.36": "Success",
-					"10.1.56.43": "Success",
-					"10.1.56.52": "Success",
-					"10.1.56.53": "Missing",
-					"10.1.56.35": "In Progress",
-					"10.1.56.56": "Success",
-				}))
-			})
-
-			It("should handle a lack of suffices in the output", func() {
-				output := "  10.1.56.36  ---- Successfully excluded. It is now safe to remove this process from the cluster.\n" +
-					"  10.1.56.43  ---- Successfully excluded. It is now safe to remove this process from the cluster.\n" +
-					"  10.1.56.52  ---- Successfully excluded. It is now safe to remove this process from the cluster.\n" +
-					"  10.1.56.53  ---- WARNING: Missing from cluster! Be sure that you excluded the correct processes" +
-					" before removing them from the cluster!\n" +
-					"  10.1.56.35  ---- WARNING: Exclusion in progress! It is not safe to remove this process from the cluster\n" +
-					"  10.1.56.56  ---- Successfully excluded. It is now safe to remove this process from the cluster.\n" +
-					"WARNING: 10.1.56.56:4500 is a coordinator!\n" +
-					"Type `help coordinators' for information on how to change the\n" +
-					"cluster's coordination servers before removing them."
-				results := parseExclusionOutput(output)
-				Expect(results).To(Equal(map[string]string{
-					"10.1.56.36": "Success",
-					"10.1.56.43": "Success",
-					"10.1.56.52": "Success",
-					"10.1.56.53": "Missing",
-					"10.1.56.35": "In Progress",
-					"10.1.56.56": "Success",
-				}))
-			})
-
-			It("should handle ports in the output", func() {
-				output := "  10.1.56.36:4500  ---- Successfully excluded. It is now safe to remove this process from the cluster.\n" +
-					"  10.1.56.43:4500  ---- Successfully excluded. It is now safe to remove this process from the cluster.\n" +
-					"  10.1.56.52:4500  ---- Successfully excluded. It is now safe to remove this process from the cluster.\n" +
-					"  10.1.56.53:4500  ---- WARNING: Missing from cluster! Be sure that you excluded the correct processes" +
-					" before removing them from the cluster!\n" +
-					"  10.1.56.35:4500  ---- WARNING: Exclusion in progress! It is not safe to remove this process from the cluster\n" +
-					"  10.1.56.56:4500  ---- Successfully excluded. It is now safe to remove this process from the cluster.\n" +
-					"WARNING: 10.1.56.56:4500 is a coordinator!\n" +
-					"Type `help coordinators' for information on how to change the\n" +
-					"cluster's coordination servers before removing them."
-				results := parseExclusionOutput(output)
-				Expect(results).To(Equal(map[string]string{
-					"10.1.56.36:4500": "Success",
-					"10.1.56.43:4500": "Success",
-					"10.1.56.52:4500": "Success",
-					"10.1.56.53:4500": "Missing",
-					"10.1.56.35:4500": "In Progress",
-					"10.1.56.56:4500": "Success",
-				}))
-			})
-		})
-	})
-
-	type testCase struct {
-		input       string
-		expected    string
-		expectedErr error
-	}
-
-	DescribeTable("Test remove warnings in JSON string",
-		func(tc testCase) {
-			result, err := removeWarningsInJSON(tc.input)
-			// We need the if statement to make ginkgo happy:
-			//   Refusing to compare <nil> to <nil>.
-			//   Be explicit and use BeNil() instead.
-			//   This is to avoid mistakes where both sides of an assertion are erroneously uninitialized.
-			// ¯\_(ツ)_/¯
-			if tc.expectedErr == nil {
-				Expect(err).To(BeNil())
-			} else {
-				Expect(err).To(Equal(tc.expectedErr))
-			}
-			Expect(result).To(Equal(tc.expected))
-		},
-		Entry("Valid JSON without warning",
-			testCase{
-				input:       "{}",
-				expected:    "{}",
-				expectedErr: nil,
-			},
-		),
-		Entry("Valid JSON with warning",
-			testCase{
-				input: `
-# Warning Slow response
-
-{}`,
-				expected:    "{}",
-				expectedErr: nil,
-			},
-		),
-		Entry("Invalid JSON",
-			testCase{
-				input:       "}",
-				expected:    "",
-				expectedErr: fmt.Errorf("the JSON string doesn't contain a starting '{'"),
-			},
-		),
-	)
 })
