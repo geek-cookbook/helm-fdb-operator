@@ -20,6 +20,6 @@ roleRef:
 subjects:
 - kind: ServiceAccount
   name: {{ include "fdb-operator.serviceAccountName" . }}
-  {{- if .Values.operator.globalMode.enabled }}
+  {{- if .Values.globalMode.enabled }}
   namespace: {{ .Release.Namespace }}
   {{- end }}
