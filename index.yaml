@@ -2,6 +2,19 @@ apiVersion: v1
 entries:
   fdb-operator:
   - apiVersion: v2
+    appVersion: 0.37.0
+    created: "2021-08-10T05:23:37.763671986Z"
+    description: A Helm chart for foundationDB operator
+    digest: 861574ba9451e96e06a859b75d7c7a53baa6cd443ce668585c6060c0728c794f
+    home: https://www.foundationdb.org/
+    name: fdb-operator
+    sources:
+    - https://github.com/FoundationDB/fdb-kubernetes-operator/tree/master/helm/fdb-operator
+    type: application
+    urls:
+    - https://github.com/geek-cookbook/helm-fdb-operator/releases/download/fdb-operator-0.37.5/fdb-operator-0.37.5.tgz
+    version: 0.37.5
+  - apiVersion: v2
     appVersion: 0.24.0
     created: "2020-12-10T04:27:50.43212057Z"
     description: A Helm chart for foundationDB operator
