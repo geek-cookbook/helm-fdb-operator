@@ -84,3 +84,8 @@ initContainerSecurityContext:
     drop:
     - all
   readOnlyRootFilesystem: true
+
+podDisruptionBudget:
+  create: false
+  minAvailable: 1
+  maxUnavailable: ""
