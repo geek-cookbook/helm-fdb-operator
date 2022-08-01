@@ -4,7 +4,10 @@ metadata:
   name: {{ include "fdb-operator.fullname" . }}
   labels:
     {{- include "fdb-operator.labels" . | nindent 4 }}
-  {{- with .Values.annotations }}  
+  {{- with .Values.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
 spec:
   selector:
     matchLabels: 
